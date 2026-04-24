@@ -1,0 +1,38 @@
+[package]
+name = "amiga_fm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libloading = "0.8"
+mdns-sd = "0.19"
+nfs3_client = { version = "0.8", features = ["tokio"] }
+netdev = "0.42"
+regex = "1.12"
+remotefs = "0.3"
+remotefs-ftp = { version = "0.4", features = ["native-tls"] }
+remotefs-ssh = { version = "0.8", default-features = false, features = ["russh"] }
+remotefs-webdav = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["rt", "rt-multi-thread"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
