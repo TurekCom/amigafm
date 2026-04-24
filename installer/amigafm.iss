@@ -1,6 +1,6 @@
 #define MyAppName "Amiga FM"
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #endif
 #define MyAppPublisher "TurekCom"
 #define MyAppExeName "amiga_fm.exe"
@@ -10,7 +10,7 @@ AppId={{2B841B92-8F79-4D12-93FA-9D08F334D4D6}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\Amiga FM
+DefaultDirName={autopf}\Amiga FM
 DefaultGroupName=Amiga FM
 DisableProgramGroupPage=yes
 OutputDir=output
@@ -20,7 +20,7 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 SetupLogging=yes
 
 [Languages]

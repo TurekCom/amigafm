@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 - 2026-04-24
+
+### Zmieniono
+
+- Panele przy pierwszym uruchomieniu pokazują listę dysków zamiast katalogu roboczego programu.
+- Program zapisuje ostatnią lokalizację lewego i prawego panelu.
+- Jeśli zapisana lokalizacja panelu jest niedostępna przy następnym uruchomieniu, panel wraca do listy dysków.
+- Instalator Inno Setup instaluje program w `Program Files` i wymaga uprawnień administratora.
+
 ## 0.1.0 - 2026-04-24
 
 Pierwsze wydanie prototypowe Amiga FM.

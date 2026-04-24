@@ -364,6 +364,8 @@ struct AppSettings {
     favorite_files: Vec<PathBuf>,
     network_resources: Vec<NetworkResource>,
     discovery_cache: DiscoveryCache,
+    left_panel_location: Option<PanelLocation>,
+    right_panel_location: Option<PanelLocation>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -374,6 +376,28 @@ struct PersistedAppSettings {
     favorite_files: Vec<PathBuf>,
     network_resources: Vec<PersistedNetworkResource>,
     discovery_cache: Vec<PersistedDiscoveryCacheEntry>,
+    left_panel_location: Option<PersistedPanelLocation>,
+    right_panel_location: Option<PersistedPanelLocation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersistedPanelLocation {
+    Drives,
+    NetworkResources,
+    FavoriteDirectories,
+    FavoriteFiles,
+    Filesystem {
+        path: PathBuf,
+    },
+    Remote {
+        resource: PersistedNetworkResource,
+        path: PathBuf,
+    },
+    Archive {
+        archive_path: PathBuf,
+        inside_path: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -825,6 +849,52 @@ impl PersistedNetworkResource {
             default_directory: self.default_directory,
             display_name: self.display_name,
             anonymous: self.anonymous,
+        }
+    }
+}
+
+impl PersistedPanelLocation {
+    fn from_runtime(location: &PanelLocation) -> io::Result<Self> {
+        match location {
+            PanelLocation::Drives => Ok(Self::Drives),
+            PanelLocation::NetworkResources => Ok(Self::NetworkResources),
+            PanelLocation::FavoriteDirectories => Ok(Self::FavoriteDirectories),
+            PanelLocation::FavoriteFiles => Ok(Self::FavoriteFiles),
+            PanelLocation::Filesystem(path) => Ok(Self::Filesystem { path: path.clone() }),
+            PanelLocation::Archive(archive) => Ok(Self::Archive {
+                archive_path: archive.archive_path.clone(),
+                inside_path: archive.inside_path.clone(),
+            }),
+            PanelLocation::Remote(remote) => Ok(Self::Remote {
+                resource: PersistedNetworkResource::from_runtime(&remote.resource)?,
+                path: remote.path.clone(),
+            }),
+        }
+    }
+
+    fn into_runtime(self) -> PanelLocation {
+        match self {
+            Self::Drives => PanelLocation::Drives,
+            Self::NetworkResources => PanelLocation::NetworkResources,
+            Self::FavoriteDirectories => PanelLocation::FavoriteDirectories,
+            Self::FavoriteFiles => PanelLocation::FavoriteFiles,
+            Self::Filesystem { path } => PanelLocation::Filesystem(path),
+            Self::Archive {
+                archive_path,
+                inside_path,
+            } => PanelLocation::Archive(ArchiveLocation {
+                archive_path,
+                inside_path,
+            }),
+            Self::Remote { resource, path } => {
+                let resource = resource.into_runtime();
+                PanelLocation::Remote(RemoteLocation {
+                    resource: resource.clone(),
+                    original_resource: resource,
+                    path,
+                    sftp_privilege_mode: SftpPrivilegeMode::Normal,
+                })
+            }
         }
     }
 }
@@ -1539,14 +1609,20 @@ struct PanelModel {
     pending_key: Option<String>,
     search_state: Option<SearchState>,
     search_in_progress: bool,
+    fallback_to_drives_on_load_error: bool,
 }
 
 impl PanelModel {
-    fn new(title: &'static str, start_path: PathBuf) -> io::Result<Self> {
+    fn new(
+        title: &'static str,
+        start_location: PanelLocation,
+        last_filesystem_path: PathBuf,
+        fallback_to_drives_on_load_error: bool,
+    ) -> io::Result<Self> {
         let mut panel = Self {
             title,
-            location: PanelLocation::Filesystem(start_path.clone()),
-            last_filesystem_path: start_path,
+            location: start_location,
+            last_filesystem_path,
             entries: Vec::new(),
             selected: 0,
             marked: HashSet::new(),
@@ -1559,6 +1635,7 @@ impl PanelModel {
             pending_key: None,
             search_state: None,
             search_in_progress: false,
+            fallback_to_drives_on_load_error,
         };
         panel.entries = Self::loading_entries(&panel.location);
         Ok(panel)
@@ -2244,9 +2321,22 @@ struct ElevatedLocalRequestFile {
 impl AppState {
     fn new() -> io::Result<Self> {
         let settings = load_settings();
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
-        let left = PanelModel::new("LEWY", current_dir.clone())?;
-        let right = PanelModel::new("PRAWY", current_dir)?;
+        let fallback_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
+        let (left_location, left_fallback) =
+            startup_panel_location(settings.left_panel_location.clone());
+        let (right_location, right_fallback) =
+            startup_panel_location(settings.right_panel_location.clone());
+        let left_last_filesystem =
+            last_filesystem_path_for_startup(settings.left_panel_location.as_ref(), &fallback_dir);
+        let right_last_filesystem =
+            last_filesystem_path_for_startup(settings.right_panel_location.as_ref(), &fallback_dir);
+        let left = PanelModel::new("LEWY", left_location, left_last_filesystem, left_fallback)?;
+        let right = PanelModel::new(
+            "PRAWY",
+            right_location,
+            right_last_filesystem,
+            right_fallback,
+        )?;
         let nvda = NvdaController::new();
         let (panel_load_sender, panel_load_receiver) = mpsc::channel();
         let (search_sender, search_receiver) = mpsc::channel();
@@ -2300,6 +2390,8 @@ impl AppState {
     fn save_settings(&mut self) -> io::Result<()> {
         self.settings.view_options = self.view_options;
         self.settings.discovery_cache = self.discovery_cache.clone();
+        self.settings.left_panel_location = Some(self.panels[0].location.clone());
+        self.settings.right_panel_location = Some(self.panels[1].location.clone());
         save_settings_file(&self.settings)
     }
 
@@ -2998,7 +3090,31 @@ impl AppState {
                     let _ = self.refresh_and_keep(message.panel_index, None);
                     continue;
                 }
+                if self.panels[message.panel_index].fallback_to_drives_on_load_error
+                    && !matches!(
+                        self.panels[message.panel_index].location,
+                        PanelLocation::Drives
+                    )
+                {
+                    let panel = &mut self.panels[message.panel_index];
+                    panel.fallback_to_drives_on_load_error = false;
+                    panel.search_state = None;
+                    panel.search_in_progress = false;
+                    panel.marked.clear();
+                    panel.location = PanelLocation::Drives;
+                    panel.entries = PanelModel::loading_entries(&panel.location);
+                    panel.selected = 0;
+                    self.rebuild_panel(message.panel_index);
+                    let _ = self.refresh_panel_after_mutation(message.panel_index, None);
+                    if self.active_panel == message.panel_index {
+                        self.notify(
+                            "poprzednia lokalizacja panelu jest niedostępna, pokazuję dyski",
+                        );
+                    }
+                    continue;
+                }
                 let panel = &mut self.panels[message.panel_index];
+                panel.fallback_to_drives_on_load_error = false;
                 panel.loading = false;
                 panel.entries = PanelModel::base_entries(&panel.location);
                 self.rebuild_panel(message.panel_index);
@@ -3023,6 +3139,7 @@ impl AppState {
 
             if message.last_chunk {
                 panel.loading = false;
+                panel.fallback_to_drives_on_load_error = false;
                 panel.marked.retain(|path| {
                     panel
                         .entries
@@ -7162,6 +7279,7 @@ impl AppState {
     }
 
     unsafe fn cleanup(&mut self) {
+        let _ = self.save_settings();
         if !self.font.is_null() {
             DeleteObject(self.font as _);
             self.font = null_mut();
@@ -11915,6 +12033,46 @@ fn settings_file_path() -> PathBuf {
     base.join("AmigaFmNative").join("settings.json")
 }
 
+fn is_unc_path(path: &Path) -> bool {
+    path.to_string_lossy().starts_with("\\\\")
+}
+
+fn panel_location_available_for_startup(location: &PanelLocation) -> bool {
+    match location {
+        PanelLocation::Filesystem(path) => is_unc_path(path) || path.is_dir(),
+        PanelLocation::Archive(archive) => archive.archive_path.exists(),
+        PanelLocation::Remote(_) => true,
+        PanelLocation::Drives
+        | PanelLocation::NetworkResources
+        | PanelLocation::FavoriteDirectories
+        | PanelLocation::FavoriteFiles => true,
+    }
+}
+
+fn startup_panel_location(saved: Option<PanelLocation>) -> (PanelLocation, bool) {
+    let Some(location) = saved else {
+        return (PanelLocation::Drives, false);
+    };
+    if panel_location_available_for_startup(&location) {
+        let fallback_on_load_error = !matches!(location, PanelLocation::Drives);
+        (location, fallback_on_load_error)
+    } else {
+        (PanelLocation::Drives, false)
+    }
+}
+
+fn last_filesystem_path_for_startup(saved: Option<&PanelLocation>, fallback_dir: &Path) -> PathBuf {
+    saved
+        .and_then(|location| match location {
+            PanelLocation::Filesystem(path) if panel_location_available_for_startup(location) => {
+                Some(path.clone())
+            }
+            PanelLocation::Archive(archive) => archive.archive_path.parent().map(Path::to_path_buf),
+            _ => None,
+        })
+        .unwrap_or_else(|| fallback_dir.to_path_buf())
+}
+
 fn load_settings() -> AppSettings {
     let path = settings_file_path();
     match fs::read_to_string(path) {
@@ -11929,6 +12087,12 @@ fn load_settings() -> AppSettings {
                     .map(PersistedNetworkResource::into_runtime)
                     .collect(),
                 discovery_cache: DiscoveryCache::from_persisted(persisted.discovery_cache),
+                left_panel_location: persisted
+                    .left_panel_location
+                    .map(PersistedPanelLocation::into_runtime),
+                right_panel_location: persisted
+                    .right_panel_location
+                    .map(PersistedPanelLocation::into_runtime),
             })
             .unwrap_or_default(),
         Err(_) => AppSettings::default(),
@@ -11950,6 +12114,16 @@ fn save_settings_file(settings: &AppSettings) -> io::Result<()> {
             .map(PersistedNetworkResource::from_runtime)
             .collect::<io::Result<Vec<_>>>()?,
         discovery_cache: settings.discovery_cache.to_persisted(),
+        left_panel_location: settings
+            .left_panel_location
+            .as_ref()
+            .map(PersistedPanelLocation::from_runtime)
+            .transpose()?,
+        right_panel_location: settings
+            .right_panel_location
+            .as_ref()
+            .map(PersistedPanelLocation::from_runtime)
+            .transpose()?,
     };
     let contents = serde_json::to_string_pretty(&persisted)
         .map_err(|error| io::Error::other(error.to_string()))?;

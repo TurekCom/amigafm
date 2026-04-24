@@ -26,7 +26,7 @@ Instalator zawiera aplikację i bibliotekę `nvdaControllerClient.dll`. 7-Zip ni
 
 ## Instalacja
 
-Pobierz `AmigaFM-Setup-0.1.0.exe` z sekcji Releases i uruchom instalator. Instalator tworzy skrót w menu Start i ikonę na pulpicie.
+Pobierz najnowszy plik `AmigaFM-Setup-*.exe` z sekcji Releases i uruchom instalator. Program jest instalowany w `Program Files`, więc instalator poprosi o uprawnienia administratora. Instalator tworzy skrót w menu Start i ikonę na pulpicie.
 
 ## Skróty klawiaturowe
 
