@@ -8,7 +8,7 @@ use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use netdev::get_interfaces;
 use netdev::interface::state::OperState;
@@ -31,13 +33,16 @@ use nfs3_client::nfs3_types::xdr_codec::Opaque;
 use nfs3_client::tokio::{TokioConnector, TokioIo};
 use nfs3_client::{MountClient, Nfs3ConnectionBuilder, PortmapperClient};
 use nvda::NvdaController;
+use rand::RngCore;
 use regex::{Regex, RegexBuilder};
 use remotefs::fs::{FileType as RemoteFileType, Metadata as RemoteMetadata, UnixPex};
 use remotefs::{File as RemoteFile, RemoteFs};
 use remotefs_ftp::FtpFs;
 use remotefs_ssh::{NoCheckServerKey, RusshSession, SftpFs, SshKeyStorage, SshOpts};
 use remotefs_webdav::WebDAVFs;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream as TokioTcpStream;
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, GetLastError, GlobalFree, HWND, LPARAM, LRESULT, LocalFree, RECT,
@@ -100,8 +105,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IDI_APPLICATION, IsDialogMessageW, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
     LB_SETTOPINDEX, LBN_DBLCLK, LBN_SELCHANGE, LBN_SETFOCUS, LBS_NOTIFY, LoadCursorW, LoadIconW,
     MB_ICONERROR, MB_OK, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
-    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_MAXIMIZE, SW_SHOW,
-    SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TPM_LEFTALIGN,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_MAXIMIZE,
+    SW_SHOW, SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TPM_LEFTALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenu, TrackPopupMenuEx,
     TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETDLGCODE, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY,
@@ -408,6 +413,8 @@ enum NetworkProtocol {
     Nfs,
     WebDav,
     Smb,
+    Dropbox,
+    GoogleDrive,
 }
 
 impl Default for NetworkProtocol {
@@ -417,13 +424,15 @@ impl Default for NetworkProtocol {
 }
 
 impl NetworkProtocol {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Sftp,
         Self::Ftp,
         Self::Ftps,
         Self::Nfs,
         Self::WebDav,
         Self::Smb,
+        Self::Dropbox,
+        Self::GoogleDrive,
     ];
 
     const fn label(self) -> &'static str {
@@ -434,6 +443,8 @@ impl NetworkProtocol {
             Self::Nfs => "NFS",
             Self::WebDav => "WebDAV",
             Self::Smb => "SMB",
+            Self::Dropbox => "Dropbox",
+            Self::GoogleDrive => "Google Drive",
         }
     }
 
@@ -445,6 +456,20 @@ impl NetworkProtocol {
             Self::Nfs => "zasób NFS",
             Self::WebDav => "zasób WebDAV",
             Self::Smb => "zasób SMB",
+            Self::Dropbox => "zasób Dropbox",
+            Self::GoogleDrive => "zasób Google Drive",
+        }
+    }
+
+    const fn is_cloud(self) -> bool {
+        matches!(self, Self::Dropbox | Self::GoogleDrive)
+    }
+
+    const fn default_host_label(self) -> Option<&'static str> {
+        match self {
+            Self::Dropbox => Some("dropbox"),
+            Self::GoogleDrive => Some("google-drive"),
+            _ => None,
         }
     }
 }
@@ -479,6 +504,8 @@ enum RemoteClient {
     Sftp(SftpFs<RusshSession<NoCheckServerKey>>),
     WebDav(WebDAVFs),
     Nfs(NfsSession),
+    Dropbox(DropboxClient),
+    GoogleDrive(GoogleDriveClient),
 }
 
 type NfsConnection = nfs3_client::Nfs3Connection<TokioIo<TokioTcpStream>>;
@@ -653,6 +680,1159 @@ impl NfsSession {
     }
 }
 
+#[derive(Clone)]
+struct DropboxClient {
+    http: reqwest::blocking::Client,
+    access_token: String,
+}
+
+struct CloudAccountIdentity {
+    host: String,
+    username: String,
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DropboxCurrentAccount {
+    account_id: String,
+    email: String,
+    name: DropboxAccountName,
+}
+
+#[derive(Deserialize)]
+struct DropboxAccountName {
+    display_name: Option<String>,
+}
+
+#[derive(Clone)]
+struct DropboxEntry {
+    tag: String,
+    name: String,
+    path_display: Option<String>,
+    size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DropboxEntryWire {
+    #[serde(rename = ".tag")]
+    tag: String,
+    name: String,
+    path_display: Option<String>,
+    size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DropboxListResponse {
+    entries: Vec<DropboxEntryWire>,
+    cursor: String,
+    has_more: bool,
+}
+
+impl DropboxClient {
+    fn new(resource: &NetworkResource) -> io::Result<Self> {
+        let http = cloud_http_client()?;
+        let mut access_token = resource.password.trim().to_string();
+        if !resource.root_password.trim().is_empty() && !resource.ssh_key.trim().is_empty() {
+            access_token = refresh_cloud_access_token(
+                NetworkProtocol::Dropbox,
+                &http,
+                resource.ssh_key.trim(),
+                resource.root_password.trim(),
+            )?;
+        }
+        if access_token.is_empty() {
+            return Err(io::Error::other(
+                "Dropbox wymaga logowania OAuth. Dodaj konto ponownie przez proces logowania.",
+            ));
+        }
+        Ok(Self { http, access_token })
+    }
+
+    fn connect(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {}
+
+    fn api_json<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        body: serde_json::Value,
+    ) -> io::Result<T> {
+        let response = self
+            .http
+            .post(format!("https://api.dropboxapi.com/2/{endpoint}"))
+            .bearer_auth(&self.access_token)
+            .json(&body)
+            .send()
+            .map_err(reqwest_to_io)?;
+        parse_cloud_response("Dropbox", response)
+    }
+
+    fn api_empty(&self, endpoint: &str, body: serde_json::Value) -> io::Result<()> {
+        let response = self
+            .http
+            .post(format!("https://api.dropboxapi.com/2/{endpoint}"))
+            .bearer_auth(&self.access_token)
+            .json(&body)
+            .send()
+            .map_err(reqwest_to_io)?;
+        ensure_cloud_success("Dropbox", response)?;
+        Ok(())
+    }
+
+    fn list_dir(&mut self, path: &Path) -> io::Result<Vec<RemoteFile>> {
+        let dropbox_path = dropbox_api_path(path);
+        let mut result: DropboxListResponse = self.api_json(
+            "files/list_folder",
+            serde_json::json!({
+                "path": dropbox_path,
+                "recursive": false,
+                "include_deleted": false,
+                "include_non_downloadable_files": true
+            }),
+        )?;
+        let mut entries = result
+            .entries
+            .drain(..)
+            .map(DropboxEntry::from)
+            .collect::<Vec<_>>();
+        while result.has_more {
+            result = self.api_json(
+                "files/list_folder/continue",
+                serde_json::json!({ "cursor": result.cursor }),
+            )?;
+            entries.extend(result.entries.drain(..).map(DropboxEntry::from));
+        }
+        Ok(entries
+            .into_iter()
+            .map(|entry| entry.to_remote_file(path))
+            .collect())
+    }
+
+    fn stat(&mut self, path: &Path) -> io::Result<RemoteFile> {
+        if is_remote_root(path) {
+            return Ok(cloud_directory_file(PathBuf::from("/")));
+        }
+        let entry: DropboxEntryWire = self.api_json(
+            "files/get_metadata",
+            serde_json::json!({
+                "path": dropbox_api_path(path),
+                "include_deleted": false
+            }),
+        )?;
+        Ok(DropboxEntry::from(entry)
+            .to_remote_file(path.parent().unwrap_or_else(|| Path::new("/"))))
+    }
+
+    fn exists(&mut self, path: &Path) -> io::Result<bool> {
+        match self.stat(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn create_dir(&mut self, path: &Path) -> io::Result<()> {
+        self.api_empty(
+            "files/create_folder_v2",
+            serde_json::json!({
+                "path": dropbox_api_path(path),
+                "autorename": false
+            }),
+        )
+    }
+
+    fn rename(&mut self, src: &Path, dest: &Path) -> io::Result<()> {
+        self.api_empty(
+            "files/move_v2",
+            serde_json::json!({
+                "from_path": dropbox_api_path(src),
+                "to_path": dropbox_api_path(dest),
+                "autorename": false
+            }),
+        )
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        self.delete(path)
+    }
+
+    fn remove_dir(&mut self, path: &Path) -> io::Result<()> {
+        self.delete(path)
+    }
+
+    fn delete(&mut self, path: &Path) -> io::Result<()> {
+        self.api_empty(
+            "files/delete_v2",
+            serde_json::json!({ "path": dropbox_api_path(path) }),
+        )
+    }
+
+    fn download_to(&mut self, src: &Path, mut dest: Box<dyn Write + Send>) -> io::Result<u64> {
+        let arg = serde_json::json!({ "path": dropbox_api_path(src) }).to_string();
+        let mut response = self
+            .http
+            .post("https://content.dropboxapi.com/2/files/download")
+            .bearer_auth(&self.access_token)
+            .header("Dropbox-API-Arg", arg)
+            .send()
+            .map_err(reqwest_to_io)?;
+        ensure_cloud_success_ref("Dropbox", &mut response)?;
+        io::copy(&mut response, &mut dest)
+    }
+
+    fn create_file(
+        &mut self,
+        path: &Path,
+        metadata: &RemoteMetadata,
+        reader: Box<dyn Read + Send>,
+    ) -> io::Result<u64> {
+        let arg = serde_json::json!({
+            "path": dropbox_api_path(path),
+            "mode": "overwrite",
+            "autorename": false,
+            "mute": false,
+            "strict_conflict": false
+        })
+        .to_string();
+        let response = self
+            .http
+            .post("https://content.dropboxapi.com/2/files/upload")
+            .bearer_auth(&self.access_token)
+            .header("Dropbox-API-Arg", arg)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(reqwest::blocking::Body::new(reader))
+            .send()
+            .map_err(reqwest_to_io)?;
+        let uploaded: DropboxEntryWire = parse_cloud_response("Dropbox", response)?;
+        Ok(uploaded.size.unwrap_or(metadata.size))
+    }
+}
+
+impl From<DropboxEntryWire> for DropboxEntry {
+    fn from(value: DropboxEntryWire) -> Self {
+        Self {
+            tag: value.tag,
+            name: value.name,
+            path_display: value.path_display,
+            size: value.size,
+        }
+    }
+}
+
+impl DropboxEntry {
+    fn to_remote_file(&self, parent: &Path) -> RemoteFile {
+        let path = self
+            .path_display
+            .as_deref()
+            .map(dropbox_display_path)
+            .unwrap_or_else(|| remote_child_path(parent, &self.name));
+        let file_type = if self.tag == "folder" {
+            RemoteFileType::Directory
+        } else {
+            RemoteFileType::File
+        };
+        RemoteFile {
+            path,
+            metadata: RemoteMetadata::default()
+                .file_type(file_type)
+                .size(self.size.unwrap_or(0)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GoogleDriveClient {
+    http: reqwest::blocking::Client,
+    access_token: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct GoogleDriveFile {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "mimeType")]
+    #[serde(default)]
+    mime_type: String,
+    size: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleDriveListResponse {
+    files: Vec<GoogleDriveFile>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleDriveAboutResponse {
+    user: GoogleDriveUser,
+}
+
+#[derive(Deserialize)]
+struct GoogleDriveUser {
+    #[serde(rename = "emailAddress")]
+    email_address: String,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+}
+
+impl GoogleDriveClient {
+    fn new(resource: &NetworkResource) -> io::Result<Self> {
+        let http = cloud_http_client()?;
+        let mut access_token = resource.password.trim().to_string();
+        if !resource.root_password.trim().is_empty() && !resource.ssh_key.trim().is_empty() {
+            access_token = refresh_cloud_access_token(
+                NetworkProtocol::GoogleDrive,
+                &http,
+                resource.ssh_key.trim(),
+                resource.root_password.trim(),
+            )?;
+        }
+        if access_token.is_empty() {
+            return Err(io::Error::other(
+                "Google Drive wymaga logowania OAuth. Dodaj konto ponownie przez proces logowania.",
+            ));
+        }
+        Ok(Self { http, access_token })
+    }
+
+    fn connect(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {}
+
+    fn list_dir(&mut self, path: &Path) -> io::Result<Vec<RemoteFile>> {
+        let folder = self.resolve_path(path)?;
+        if !folder.is_folder() {
+            return Err(io::Error::other(
+                "Google Drive: wybrany element nie jest folderem",
+            ));
+        }
+        let mut files = Vec::new();
+        let mut page_token = None::<String>;
+        loop {
+            let query = format!(
+                "'{}' in parents and trashed = false",
+                drive_query_escape(&folder.id)
+            );
+            let mut request = self
+                .http
+                .get("https://www.googleapis.com/drive/v3/files")
+                .bearer_auth(&self.access_token)
+                .query(&[
+                    ("q", query.as_str()),
+                    ("fields", "nextPageToken,files(id,name,mimeType,size)"),
+                    ("pageSize", "1000"),
+                    ("supportsAllDrives", "true"),
+                    ("includeItemsFromAllDrives", "true"),
+                ]);
+            if let Some(token) = page_token.as_deref() {
+                request = request.query(&[("pageToken", token)]);
+            }
+            let response = request.send().map_err(reqwest_to_io)?;
+            let mut page: GoogleDriveListResponse = parse_cloud_response("Google Drive", response)?;
+            files.append(&mut page.files);
+            match page.next_page_token {
+                Some(token) => page_token = Some(token),
+                None => break,
+            }
+        }
+        Ok(files
+            .into_iter()
+            .map(|file| google_drive_remote_file(remote_child_path(path, &file.name), &file))
+            .collect())
+    }
+
+    fn stat(&mut self, path: &Path) -> io::Result<RemoteFile> {
+        if is_remote_root(path) {
+            return Ok(cloud_directory_file(PathBuf::from("/")));
+        }
+        let file = self.resolve_path(path)?;
+        Ok(google_drive_remote_file(path.to_path_buf(), &file))
+    }
+
+    fn exists(&mut self, path: &Path) -> io::Result<bool> {
+        match self.resolve_path(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn create_dir(&mut self, path: &Path) -> io::Result<()> {
+        let (parent_id, name) = self.resolve_parent_and_name(path)?;
+        if let Some(existing) = self.find_child(&parent_id, &name)? {
+            if existing.is_folder() {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Google Drive: istnieje już plik o tej nazwie",
+            ));
+        }
+        let response = self
+            .http
+            .post("https://www.googleapis.com/drive/v3/files")
+            .bearer_auth(&self.access_token)
+            .query(&[("fields", "id"), ("supportsAllDrives", "true")])
+            .json(&serde_json::json!({
+                "name": name,
+                "mimeType": GOOGLE_DRIVE_FOLDER_MIME,
+                "parents": [parent_id]
+            }))
+            .send()
+            .map_err(reqwest_to_io)?;
+        ensure_cloud_success("Google Drive", response)?;
+        Ok(())
+    }
+
+    fn rename(&mut self, src: &Path, dest: &Path) -> io::Result<()> {
+        let source = self.resolve_path(src)?;
+        let (old_parent_id, _) = self.resolve_parent_and_name(src)?;
+        let (new_parent_id, new_name) = self.resolve_parent_and_name(dest)?;
+        let mut request = self
+            .http
+            .patch(format!(
+                "https://www.googleapis.com/drive/v3/files/{}",
+                source.id
+            ))
+            .bearer_auth(&self.access_token)
+            .query(&[("fields", "id"), ("supportsAllDrives", "true")]);
+        if old_parent_id != new_parent_id {
+            request = request.query(&[
+                ("addParents", new_parent_id.as_str()),
+                ("removeParents", old_parent_id.as_str()),
+            ]);
+        }
+        let response = request
+            .json(&serde_json::json!({ "name": new_name }))
+            .send()
+            .map_err(reqwest_to_io)?;
+        ensure_cloud_success("Google Drive", response)?;
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        self.delete(path)
+    }
+
+    fn remove_dir(&mut self, path: &Path) -> io::Result<()> {
+        self.delete(path)
+    }
+
+    fn delete(&mut self, path: &Path) -> io::Result<()> {
+        let file = self.resolve_path(path)?;
+        let response = self
+            .http
+            .delete(format!(
+                "https://www.googleapis.com/drive/v3/files/{}",
+                file.id
+            ))
+            .bearer_auth(&self.access_token)
+            .query(&[("supportsAllDrives", "true")])
+            .send()
+            .map_err(reqwest_to_io)?;
+        ensure_cloud_success("Google Drive", response)?;
+        Ok(())
+    }
+
+    fn download_to(&mut self, src: &Path, mut dest: Box<dyn Write + Send>) -> io::Result<u64> {
+        let file = self.resolve_path(src)?;
+        if file.is_folder() {
+            return Err(io::Error::other(
+                "Google Drive: nie można pobrać folderu jako pliku",
+            ));
+        }
+        if file.mime_type.starts_with("application/vnd.google-apps.") {
+            return Err(io::Error::other(
+                "Google Drive: pliki Google Workspace wymagają eksportu, którego ta wersja jeszcze nie obsługuje",
+            ));
+        }
+        let mut response = self
+            .http
+            .get(format!(
+                "https://www.googleapis.com/drive/v3/files/{}",
+                file.id
+            ))
+            .bearer_auth(&self.access_token)
+            .query(&[("alt", "media"), ("supportsAllDrives", "true")])
+            .send()
+            .map_err(reqwest_to_io)?;
+        ensure_cloud_success_ref("Google Drive", &mut response)?;
+        io::copy(&mut response, &mut dest)
+    }
+
+    fn create_file(
+        &mut self,
+        path: &Path,
+        metadata: &RemoteMetadata,
+        reader: Box<dyn Read + Send>,
+    ) -> io::Result<u64> {
+        let (parent_id, name) = self.resolve_parent_and_name(path)?;
+        if let Some(existing) = self.find_child(&parent_id, &name)? {
+            if existing.is_folder() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Google Drive: istnieje już folder o tej nazwie",
+                ));
+            }
+            let response = self
+                .http
+                .patch(format!(
+                    "https://www.googleapis.com/upload/drive/v3/files/{}",
+                    existing.id
+                ))
+                .bearer_auth(&self.access_token)
+                .query(&[
+                    ("uploadType", "media"),
+                    ("fields", "id,size"),
+                    ("supportsAllDrives", "true"),
+                ])
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(reqwest::blocking::Body::new(reader))
+                .send()
+                .map_err(reqwest_to_io)?;
+            let uploaded: GoogleDriveFile = parse_cloud_response("Google Drive", response)?;
+            return Ok(uploaded.size_as_u64().unwrap_or(metadata.size));
+        }
+
+        let response = self
+            .http
+            .post("https://www.googleapis.com/upload/drive/v3/files")
+            .bearer_auth(&self.access_token)
+            .query(&[("uploadType", "media"), ("fields", "id")])
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(reqwest::blocking::Body::new(reader))
+            .send()
+            .map_err(reqwest_to_io)?;
+        let uploaded: GoogleDriveFile = parse_cloud_response("Google Drive", response)?;
+        self.patch_created_upload(&uploaded.id, &parent_id, &name)?;
+        Ok(metadata.size)
+    }
+
+    fn patch_created_upload(&self, file_id: &str, parent_id: &str, name: &str) -> io::Result<()> {
+        let mut request = self
+            .http
+            .patch(format!(
+                "https://www.googleapis.com/drive/v3/files/{file_id}"
+            ))
+            .bearer_auth(&self.access_token)
+            .query(&[("fields", "id"), ("supportsAllDrives", "true")]);
+        if parent_id != "root" {
+            request = request.query(&[("addParents", parent_id), ("removeParents", "root")]);
+        }
+        let response = request
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .map_err(reqwest_to_io)?;
+        ensure_cloud_success("Google Drive", response)?;
+        Ok(())
+    }
+
+    fn resolve_parent_and_name(&self, path: &Path) -> io::Result<(String, String)> {
+        let mut segments = cloud_path_segments(path);
+        let Some(name) = segments.pop() else {
+            return Err(io::Error::other("Google Drive: brak nazwy elementu"));
+        };
+        let parent = self.resolve_segments(&segments)?;
+        if !parent.is_folder() {
+            return Err(io::Error::other(
+                "Google Drive: katalog nadrzędny nie jest folderem",
+            ));
+        }
+        Ok((parent.id, name))
+    }
+
+    fn resolve_path(&self, path: &Path) -> io::Result<GoogleDriveFile> {
+        let segments = cloud_path_segments(path);
+        self.resolve_segments(&segments)
+    }
+
+    fn resolve_segments(&self, segments: &[String]) -> io::Result<GoogleDriveFile> {
+        let mut current = GoogleDriveFile::root();
+        for segment in segments {
+            if !current.is_folder() {
+                return Err(io::Error::other(
+                    "Google Drive: ścieżka przechodzi przez plik",
+                ));
+            }
+            let next = self.find_child(&current.id, segment)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Google Drive: nie znaleziono {segment}"),
+                )
+            })?;
+            current = next;
+        }
+        Ok(current)
+    }
+
+    fn find_child(&self, parent_id: &str, name: &str) -> io::Result<Option<GoogleDriveFile>> {
+        let query = format!(
+            "'{}' in parents and name = '{}' and trashed = false",
+            drive_query_escape(parent_id),
+            drive_query_escape(name)
+        );
+        let response = self
+            .http
+            .get("https://www.googleapis.com/drive/v3/files")
+            .bearer_auth(&self.access_token)
+            .query(&[
+                ("q", query.as_str()),
+                ("fields", "files(id,name,mimeType,size)"),
+                ("pageSize", "10"),
+                ("supportsAllDrives", "true"),
+                ("includeItemsFromAllDrives", "true"),
+            ])
+            .send()
+            .map_err(reqwest_to_io)?;
+        let page: GoogleDriveListResponse = parse_cloud_response("Google Drive", response)?;
+        Ok(page.files.into_iter().next())
+    }
+}
+
+impl GoogleDriveFile {
+    fn root() -> Self {
+        Self {
+            id: "root".to_string(),
+            name: "root".to_string(),
+            mime_type: GOOGLE_DRIVE_FOLDER_MIME.to_string(),
+            size: None,
+        }
+    }
+
+    fn is_folder(&self) -> bool {
+        self.mime_type == GOOGLE_DRIVE_FOLDER_MIME
+    }
+
+    fn size_as_u64(&self) -> Option<u64> {
+        self.size.as_deref()?.parse().ok()
+    }
+}
+
+const GOOGLE_DRIVE_FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+
+fn cloud_http_client() -> io::Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(reqwest_to_io)
+}
+
+fn perform_cloud_oauth(protocol: NetworkProtocol, client_id: &str) -> io::Result<NetworkResource> {
+    let http = cloud_http_client()?;
+    let listener = bind_oauth_listener(protocol)?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}/callback",
+        listener.local_addr()?.port()
+    );
+    let code_verifier = random_url_token(48);
+    let code_challenge = oauth_code_challenge(&code_verifier);
+    let state = random_url_token(24);
+    let authorize_url =
+        cloud_authorize_url(protocol, client_id, &redirect_uri, &code_challenge, &state)?;
+
+    open_with_system_target(&authorize_url)?;
+    let code = wait_for_oauth_callback(listener, &state)?;
+    let tokens = exchange_oauth_code(
+        protocol,
+        &http,
+        client_id,
+        &redirect_uri,
+        &code_verifier,
+        &code,
+    )?;
+    let identity = fetch_cloud_identity(protocol, &http, &tokens.access_token)?;
+    let expires_at = tokens
+        .expires_in
+        .map(|seconds| current_unix_timestamp().saturating_add(seconds))
+        .unwrap_or_default();
+
+    Ok(NetworkResource {
+        protocol,
+        host: identity.host,
+        username: identity.username,
+        password: tokens.access_token,
+        root_password: tokens.refresh_token.unwrap_or_default(),
+        sudo_password: if expires_at == 0 {
+            String::new()
+        } else {
+            expires_at.to_string()
+        },
+        ssh_key: client_id.trim().to_string(),
+        default_directory: String::new(),
+        display_name: identity.display_name,
+        anonymous: false,
+    })
+}
+
+fn preferred_oauth_port(protocol: NetworkProtocol) -> u16 {
+    match protocol {
+        NetworkProtocol::Dropbox => 53682,
+        NetworkProtocol::GoogleDrive => 53683,
+        _ => 53684,
+    }
+}
+
+fn bind_oauth_listener(protocol: NetworkProtocol) -> io::Result<TcpListener> {
+    let preferred_port = preferred_oauth_port(protocol);
+    match TcpListener::bind(("127.0.0.1", preferred_port)) {
+        Ok(listener) => Ok(listener),
+        Err(error) if protocol == NetworkProtocol::Dropbox => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "nie można uruchomić lokalnego callbacku Dropbox na porcie {preferred_port}: {error}"
+            ),
+        )),
+        Err(_) => TcpListener::bind(("127.0.0.1", 0)),
+    }
+}
+
+fn cloud_authorize_url(
+    protocol: NetworkProtocol,
+    client_id: &str,
+    redirect_uri: &str,
+    code_challenge: &str,
+    state: &str,
+) -> io::Result<String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        return Err(io::Error::other("brak identyfikatora aplikacji OAuth"));
+    }
+
+    let (base_url, pairs) = match protocol {
+        NetworkProtocol::Dropbox => (
+            "https://www.dropbox.com/oauth2/authorize",
+            vec![
+                ("client_id", client_id),
+                ("response_type", "code"),
+                ("redirect_uri", redirect_uri),
+                ("code_challenge", code_challenge),
+                ("code_challenge_method", "S256"),
+                ("token_access_type", "offline"),
+                ("state", state),
+            ],
+        ),
+        NetworkProtocol::GoogleDrive => (
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            vec![
+                ("client_id", client_id),
+                ("response_type", "code"),
+                ("redirect_uri", redirect_uri),
+                ("scope", "https://www.googleapis.com/auth/drive"),
+                ("access_type", "offline"),
+                ("prompt", "consent"),
+                ("code_challenge", code_challenge),
+                ("code_challenge_method", "S256"),
+                ("state", state),
+            ],
+        ),
+        _ => {
+            return Err(io::Error::other(
+                "wybrany protokół nie obsługuje logowania OAuth",
+            ));
+        }
+    };
+
+    Ok(format!("{base_url}?{}", url_encoded_query(&pairs)))
+}
+
+fn exchange_oauth_code(
+    protocol: NetworkProtocol,
+    http: &reqwest::blocking::Client,
+    client_id: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    code: &str,
+) -> io::Result<OAuthTokenResponse> {
+    let token_url = match protocol {
+        NetworkProtocol::Dropbox => "https://api.dropboxapi.com/oauth2/token",
+        NetworkProtocol::GoogleDrive => "https://oauth2.googleapis.com/token",
+        _ => return Err(io::Error::other("nieobsługiwany dostawca OAuth")),
+    };
+    let response = http
+        .post(token_url)
+        .form(&[
+            ("code", code),
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id.trim()),
+            ("code_verifier", code_verifier),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .map_err(reqwest_to_io)?;
+    parse_cloud_response(protocol.label(), response)
+}
+
+fn refresh_cloud_access_token(
+    protocol: NetworkProtocol,
+    http: &reqwest::blocking::Client,
+    client_id: &str,
+    refresh_token: &str,
+) -> io::Result<String> {
+    let token_url = match protocol {
+        NetworkProtocol::Dropbox => "https://api.dropboxapi.com/oauth2/token",
+        NetworkProtocol::GoogleDrive => "https://oauth2.googleapis.com/token",
+        _ => return Err(io::Error::other("nieobsługiwany dostawca OAuth")),
+    };
+    let response = http
+        .post(token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id.trim()),
+        ])
+        .send()
+        .map_err(reqwest_to_io)?;
+    let tokens: OAuthTokenResponse = parse_cloud_response(protocol.label(), response)?;
+    if tokens.access_token.trim().is_empty() {
+        Err(io::Error::other("dostawca OAuth nie zwrócił access tokena"))
+    } else {
+        Ok(tokens.access_token)
+    }
+}
+
+fn fetch_cloud_identity(
+    protocol: NetworkProtocol,
+    http: &reqwest::blocking::Client,
+    access_token: &str,
+) -> io::Result<CloudAccountIdentity> {
+    match protocol {
+        NetworkProtocol::Dropbox => {
+            let response = http
+                .post("https://api.dropboxapi.com/2/users/get_current_account")
+                .bearer_auth(access_token)
+                .send()
+                .map_err(reqwest_to_io)?;
+            let account: DropboxCurrentAccount = parse_cloud_response("Dropbox", response)?;
+            let DropboxCurrentAccount {
+                account_id,
+                email,
+                name,
+            } = account;
+            let visible_name = name
+                .display_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| email.clone());
+            Ok(CloudAccountIdentity {
+                host: account_id,
+                username: email,
+                display_name: format!("Dropbox: {visible_name}"),
+            })
+        }
+        NetworkProtocol::GoogleDrive => {
+            let response = http
+                .get("https://www.googleapis.com/drive/v3/about")
+                .bearer_auth(access_token)
+                .query(&[("fields", "user(emailAddress,displayName)")])
+                .send()
+                .map_err(reqwest_to_io)?;
+            let about: GoogleDriveAboutResponse = parse_cloud_response("Google Drive", response)?;
+            let GoogleDriveUser {
+                email_address,
+                display_name,
+            } = about.user;
+            let visible_name = display_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| email_address.clone());
+            Ok(CloudAccountIdentity {
+                host: email_address.clone(),
+                username: email_address,
+                display_name: format!("Google Drive: {visible_name}"),
+            })
+        }
+        _ => Err(io::Error::other(
+            "wybrany protokół nie obsługuje logowania OAuth",
+        )),
+    }
+}
+
+fn wait_for_oauth_callback(listener: TcpListener, expected_state: &str) -> io::Result<String> {
+    listener.set_nonblocking(true)?;
+    let started_at = Instant::now();
+    while started_at.elapsed() < Duration::from_secs(300) {
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buffer = [0u8; 8192];
+                let bytes = stream.read(&mut buffer)?;
+                let request = String::from_utf8_lossy(&buffer[..bytes]);
+                let parsed = parse_oauth_callback_request(&request, expected_state);
+                let body = if parsed.is_ok() {
+                    "Logowanie zakonczone. Mozesz wrocic do Amiga FM."
+                } else {
+                    "Logowanie nie zostalo zakonczone. Wroc do Amiga FM."
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.as_bytes().len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Both);
+                return parsed;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "nie odebrano odpowiedzi logowania OAuth w ciągu 5 minut",
+    ))
+}
+
+fn parse_oauth_callback_request(request: &str, expected_state: &str) -> io::Result<String> {
+    let first_line = request.lines().next().unwrap_or_default();
+    let target = first_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| io::Error::other("nieprawidłowa odpowiedź OAuth"))?;
+    let query = target
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default();
+    let params = parse_url_query(query);
+    if let Some(error) = params.get("error") {
+        let description = params
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "logowanie OAuth przerwane: {error} {description}"
+        )));
+    }
+    if params.get("state").map(String::as_str) != Some(expected_state) {
+        return Err(io::Error::other(
+            "odpowiedź OAuth ma niezgodny parametr state",
+        ));
+    }
+    params
+        .get("code")
+        .filter(|code| !code.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| io::Error::other("odpowiedź OAuth nie zawiera kodu autoryzacji"))
+}
+
+fn random_url_token(byte_count: usize) -> String {
+    let mut bytes = vec![0u8; byte_count];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn oauth_code_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn url_encoded_query(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                url_encode_component(key),
+                url_encode_component(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn url_encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn parse_url_query(query: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for pair in query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.insert(url_decode_component(key), url_decode_component(value));
+    }
+    params
+}
+
+fn url_decode_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) =
+                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+                {
+                    decoded.push((high << 4) | low);
+                    index += 3;
+                } else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn reqwest_to_io(error: reqwest::Error) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+fn parse_cloud_response<T: DeserializeOwned>(
+    service: &str,
+    response: reqwest::blocking::Response,
+) -> io::Result<T> {
+    let response = ensure_cloud_success(service, response)?;
+    response.json::<T>().map_err(reqwest_to_io)
+}
+
+fn ensure_cloud_success(
+    service: &str,
+    response: reqwest::blocking::Response,
+) -> io::Result<reqwest::blocking::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    Err(cloud_status_error(service, response))
+}
+
+fn ensure_cloud_success_ref(
+    service: &str,
+    response: &mut reqwest::blocking::Response,
+) -> io::Result<()> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let mut body = String::new();
+    let _ = response.read_to_string(&mut body);
+    Err(cloud_status_error_from_parts(service, status, body))
+}
+
+fn cloud_status_error(service: &str, response: reqwest::blocking::Response) -> io::Error {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    cloud_status_error_from_parts(service, status, body)
+}
+
+fn cloud_status_error_from_parts(
+    service: &str,
+    status: reqwest::StatusCode,
+    body: String,
+) -> io::Error {
+    let kind =
+        if status == reqwest::StatusCode::NOT_FOUND || body.to_lowercase().contains("not_found") {
+            io::ErrorKind::NotFound
+        } else {
+            io::ErrorKind::Other
+        };
+    io::Error::new(kind, format!("{service} HTTP {status}: {}", body.trim()))
+}
+
+fn is_remote_root(path: &Path) -> bool {
+    let normalized = remote_shell_path(path);
+    normalized.is_empty() || normalized == "." || normalized == "/"
+}
+
+fn dropbox_api_path(path: &Path) -> String {
+    if is_remote_root(path) {
+        String::new()
+    } else {
+        let normalized = remote_shell_path(path);
+        if normalized.starts_with('/') {
+            normalized
+        } else {
+            format!("/{normalized}")
+        }
+    }
+}
+
+fn dropbox_display_path(path: &str) -> PathBuf {
+    if path.is_empty() {
+        PathBuf::from("/")
+    } else if path.starts_with('/') {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(format!("/{path}"))
+    }
+}
+
+fn cloud_path_segments(path: &Path) -> Vec<String> {
+    remote_shell_path(path)
+        .split('/')
+        .filter_map(|part| match part.trim() {
+            "" | "." => None,
+            ".." => None,
+            value => Some(value.to_string()),
+        })
+        .collect()
+}
+
+fn cloud_directory_file(path: PathBuf) -> RemoteFile {
+    RemoteFile {
+        path,
+        metadata: RemoteMetadata::default().file_type(RemoteFileType::Directory),
+    }
+}
+
+fn google_drive_remote_file(path: PathBuf, file: &GoogleDriveFile) -> RemoteFile {
+    let file_type = if file.is_folder() {
+        RemoteFileType::Directory
+    } else {
+        RemoteFileType::File
+    };
+    RemoteFile {
+        path,
+        metadata: RemoteMetadata::default()
+            .file_type(file_type)
+            .size(file.size_as_u64().unwrap_or(0)),
+    }
+}
+
+fn drive_query_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct PersistedNetworkResource {
@@ -697,14 +1877,19 @@ impl NetworkResource {
 
     fn summary_line(&self) -> String {
         let display_name = self.display_name.trim();
-        let auth =
-            if self.anonymous || (self.username.trim().is_empty() && self.password.is_empty()) {
-                "bez danych logowania".to_string()
-            } else if self.username.trim().is_empty() {
-                "z hasłem".to_string()
+        let auth = if self.protocol.is_cloud() {
+            if self.password.is_empty() {
+                "bez tokena OAuth".to_string()
             } else {
-                format!("użytkownik {}", self.username.trim())
-            };
+                "token OAuth zapisany".to_string()
+            }
+        } else if self.anonymous || (self.username.trim().is_empty() && self.password.is_empty()) {
+            "bez danych logowania".to_string()
+        } else if self.username.trim().is_empty() {
+            "z hasłem".to_string()
+        } else {
+            format!("użytkownik {}", self.username.trim())
+        };
         let directory = if self.default_directory.trim().is_empty() {
             "katalog domyślny nieustawiony".to_string()
         } else {
@@ -763,6 +1948,20 @@ impl NetworkResource {
                     .to_string();
                 build_network_uri(scheme, &clean_host, directory, self)
             }
+            NetworkProtocol::Dropbox => {
+                if directory.is_empty() {
+                    "dropbox://root".to_string()
+                } else {
+                    format!("dropbox://root/{directory}")
+                }
+            }
+            NetworkProtocol::GoogleDrive => {
+                if directory.is_empty() {
+                    "googledrive://root".to_string()
+                } else {
+                    format!("googledrive://root/{directory}")
+                }
+            }
         }
     }
 
@@ -778,6 +1977,8 @@ impl NetworkResource {
                 | NetworkProtocol::Ftps
                 | NetworkProtocol::Nfs
                 | NetworkProtocol::WebDav
+                | NetworkProtocol::Dropbox
+                | NetworkProtocol::GoogleDrive
         ) {
             Some(RemoteLocation {
                 resource: self.clone(),
@@ -906,6 +2107,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.connect().map(|_| ()).map_err(remote_error_to_io),
             Self::WebDav(client) => client.connect().map(|_| ()).map_err(remote_error_to_io),
             Self::Nfs(client) => client.connect(),
+            Self::Dropbox(client) => client.connect(),
+            Self::GoogleDrive(client) => client.connect(),
         }
     }
 
@@ -918,6 +2121,14 @@ impl RemoteClient {
                 client.disconnect();
                 Ok(())
             }
+            Self::Dropbox(client) => {
+                client.disconnect();
+                Ok(())
+            }
+            Self::GoogleDrive(client) => {
+                client.disconnect();
+                Ok(())
+            }
         };
     }
 
@@ -927,6 +2138,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.list_dir(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.list_dir(path).map_err(remote_error_to_io),
             Self::Nfs(client) => client.list_dir(path),
+            Self::Dropbox(client) => client.list_dir(path),
+            Self::GoogleDrive(client) => client.list_dir(path),
         }
     }
 
@@ -936,6 +2149,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.stat(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.stat(path).map_err(remote_error_to_io),
             Self::Nfs(client) => client.stat(path),
+            Self::Dropbox(client) => client.stat(path),
+            Self::GoogleDrive(client) => client.stat(path),
         }
     }
 
@@ -945,6 +2160,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.exists(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.exists(path).map_err(remote_error_to_io),
             Self::Nfs(client) => client.exists(path),
+            Self::Dropbox(client) => client.exists(path),
+            Self::GoogleDrive(client) => client.exists(path),
         }
     }
 
@@ -960,6 +2177,8 @@ impl RemoteClient {
                 .create_dir(path, UnixPex::from(0o755))
                 .map_err(remote_error_to_io),
             Self::Nfs(client) => client.create_dir(path),
+            Self::Dropbox(client) => client.create_dir(path),
+            Self::GoogleDrive(client) => client.create_dir(path),
         }
     }
 
@@ -969,6 +2188,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.mov(src, dest).map_err(remote_error_to_io),
             Self::WebDav(client) => client.mov(src, dest).map_err(remote_error_to_io),
             Self::Nfs(client) => client.rename(src, dest),
+            Self::Dropbox(client) => client.rename(src, dest),
+            Self::GoogleDrive(client) => client.rename(src, dest),
         }
     }
 
@@ -978,6 +2199,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.remove_file(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.remove_file(path).map_err(remote_error_to_io),
             Self::Nfs(client) => client.remove_file(path),
+            Self::Dropbox(client) => client.remove_file(path),
+            Self::GoogleDrive(client) => client.remove_file(path),
         }
     }
 
@@ -987,6 +2210,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.remove_dir(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.remove_dir(path).map_err(remote_error_to_io),
             Self::Nfs(client) => client.remove_dir(path),
+            Self::Dropbox(client) => client.remove_dir(path),
+            Self::GoogleDrive(client) => client.remove_dir(path),
         }
     }
 
@@ -996,6 +2221,8 @@ impl RemoteClient {
             Self::Sftp(client) => client.open_file(src, dest).map_err(remote_error_to_io),
             Self::WebDav(client) => client.open_file(src, dest).map_err(remote_error_to_io),
             Self::Nfs(client) => client.download_to(src, dest),
+            Self::Dropbox(client) => client.download_to(src, dest),
+            Self::GoogleDrive(client) => client.download_to(src, dest),
         }
     }
 
@@ -1016,6 +2243,8 @@ impl RemoteClient {
                 .create_file(path, metadata, reader)
                 .map_err(remote_error_to_io),
             Self::Nfs(client) => client.create_file(path, metadata, reader),
+            Self::Dropbox(client) => client.create_file(path, metadata, reader),
+            Self::GoogleDrive(client) => client.create_file(path, metadata, reader),
         }
     }
 
@@ -1997,12 +3226,18 @@ struct NetworkDialogState {
     prompt_lines: Vec<String>,
     info_hwnd: HWND,
     protocol_hwnd: HWND,
+    host_label_hwnd: HWND,
     host_hwnd: HWND,
+    username_label_hwnd: HWND,
     username_hwnd: HWND,
+    password_label_hwnd: HWND,
     password_hwnd: HWND,
+    ssh_key_label_hwnd: HWND,
     ssh_key_hwnd: HWND,
     ssh_key_browse_hwnd: HWND,
+    directory_label_hwnd: HWND,
     directory_hwnd: HWND,
+    display_name_label_hwnd: HWND,
     display_name_hwnd: HWND,
     anonymous_hwnd: HWND,
     ok_hwnd: HWND,
@@ -8341,9 +9576,9 @@ unsafe extern "system" fn network_dialog_proc(
                 wide("BUTTON").as_ptr(),
                 wide("Dodaj").as_ptr(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
-                350,
+                302,
                 row,
-                84,
+                132,
                 28,
                 hwnd,
                 ID_DIALOG_OK as HMENU,
@@ -8413,12 +9648,18 @@ unsafe extern "system" fn network_dialog_proc(
 
             state.info_hwnd = prompt_hwnd;
             state.protocol_hwnd = protocol_hwnd;
+            state.host_label_hwnd = host_label;
             state.host_hwnd = host_hwnd;
+            state.username_label_hwnd = user_label;
             state.username_hwnd = username_hwnd;
+            state.password_label_hwnd = password_label;
             state.password_hwnd = password_hwnd;
+            state.ssh_key_label_hwnd = key_label;
             state.ssh_key_hwnd = ssh_key_hwnd;
             state.ssh_key_browse_hwnd = ssh_key_browse_hwnd;
+            state.directory_label_hwnd = directory_label;
             state.directory_hwnd = directory_hwnd;
+            state.display_name_label_hwnd = display_label;
             state.display_name_hwnd = display_name_hwnd;
             state.anonymous_hwnd = anonymous_hwnd;
             state.ok_hwnd = ok_hwnd;
@@ -8433,19 +9674,7 @@ unsafe extern "system" fn network_dialog_proc(
             let Some(state) = network_dialog_state_mut(hwnd) else {
                 return 0;
             };
-            let mut order = Vec::with_capacity(12);
-            order.push(state.info_hwnd);
-            order.push(state.protocol_hwnd);
-            order.push(state.host_hwnd);
-            order.push(state.username_hwnd);
-            order.push(state.password_hwnd);
-            order.push(state.anonymous_hwnd);
-            order.push(state.ssh_key_hwnd);
-            order.push(state.ssh_key_browse_hwnd);
-            order.push(state.directory_hwnd);
-            order.push(state.display_name_hwnd);
-            order.push(state.ok_hwnd);
-            order.push(state.cancel_hwnd);
+            let order = network_dialog_tab_order(state);
             focus_in_order(&order, lparam as HWND, wparam != 0);
             0
         }
@@ -8480,20 +9709,51 @@ unsafe extern "system" fn network_dialog_proc(
                     0
                 }
                 ID_DIALOG_OK => {
+                    let (protocol, app_owner, initial_client_id) =
+                        if let Some(state) = network_dialog_state_mut(hwnd) {
+                            (
+                                selected_network_protocol(state),
+                                state.owner,
+                                state.initial.ssh_key.clone(),
+                            )
+                        } else {
+                            return 0;
+                        };
+                    if protocol.is_cloud() {
+                        if let Some(resource) = authorize_cloud_resource_from_dialog(
+                            hwnd,
+                            app_owner,
+                            protocol,
+                            &initial_client_id,
+                        ) {
+                            if let Some(state) = network_dialog_state_mut(hwnd) {
+                                state.result = Some(resource);
+                                state.accepted = true;
+                            }
+                            DestroyWindow(hwnd);
+                        }
+                        return 0;
+                    }
                     if let Some(state) = network_dialog_state_mut(hwnd) {
-                        let host = read_window_text(state.host_hwnd);
-                        if host.trim().is_empty() {
+                        let mut host = read_window_text(state.host_hwnd).trim().to_string();
+                        if host.is_empty() {
+                            if let Some(default_host) = protocol.default_host_label() {
+                                host = default_host.to_string();
+                            }
+                        }
+                        if host.is_empty() {
                             if let Some(app) = app_state_mut(state.owner) {
                                 app.nvda.speak("adres hosta nie może być pusty");
                             }
                             SetFocus(state.host_hwnd);
                             return 0;
                         }
+                        let password = read_window_text(state.password_hwnd);
                         let resource = NetworkResource {
-                            protocol: selected_network_protocol(state),
-                            host: host.trim().to_string(),
+                            protocol,
+                            host,
                             username: read_window_text(state.username_hwnd).trim().to_string(),
-                            password: read_window_text(state.password_hwnd),
+                            password,
                             root_password: state.initial.root_password.clone(),
                             sudo_password: state.initial.sudo_password.clone(),
                             ssh_key: read_window_text(state.ssh_key_hwnd).trim().to_string(),
@@ -9487,8 +10747,149 @@ unsafe fn selected_network_protocol(state: &NetworkDialogState) -> NetworkProtoc
     }
 }
 
+unsafe fn network_dialog_tab_order(state: &NetworkDialogState) -> Vec<HWND> {
+    let protocol = selected_network_protocol(state);
+    let mut order = Vec::with_capacity(12);
+    order.push(state.info_hwnd);
+    order.push(state.protocol_hwnd);
+    if !protocol.is_cloud() {
+        order.push(state.host_hwnd);
+        order.push(state.username_hwnd);
+        order.push(state.password_hwnd);
+        order.push(state.anonymous_hwnd);
+        order.push(state.ssh_key_hwnd);
+        order.push(state.ssh_key_browse_hwnd);
+        order.push(state.directory_hwnd);
+        order.push(state.display_name_hwnd);
+    }
+    order.push(state.ok_hwnd);
+    order.push(state.cancel_hwnd);
+    order
+}
+
+unsafe fn set_dialog_child_visible(control: HWND, visible: bool, enabled_when_visible: bool) {
+    if control.is_null() {
+        return;
+    }
+    ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+    EnableWindow(
+        control,
+        if visible && enabled_when_visible {
+            1
+        } else {
+            0
+        },
+    );
+}
+
 unsafe fn update_network_dialog_state(hwnd: HWND) {
-    let _ = hwnd;
+    let Some(state) = network_dialog_state_mut(hwnd) else {
+        return;
+    };
+    let is_cloud = selected_network_protocol(state).is_cloud();
+    let show_server_fields = !is_cloud;
+    for control in [
+        state.host_label_hwnd,
+        state.host_hwnd,
+        state.username_label_hwnd,
+        state.username_hwnd,
+        state.password_label_hwnd,
+        state.password_hwnd,
+        state.anonymous_hwnd,
+        state.ssh_key_label_hwnd,
+        state.ssh_key_hwnd,
+        state.ssh_key_browse_hwnd,
+        state.directory_label_hwnd,
+        state.directory_hwnd,
+        state.display_name_label_hwnd,
+        state.display_name_hwnd,
+    ] {
+        set_dialog_child_visible(control, show_server_fields, show_server_fields);
+    }
+    if !state.ok_hwnd.is_null() {
+        let label = if is_cloud { "Zaloguj i dodaj" } else { "Dodaj" };
+        SetWindowTextW(state.ok_hwnd, wide(label).as_ptr());
+    }
+}
+
+unsafe fn authorize_cloud_resource_from_dialog(
+    dialog_hwnd: HWND,
+    app_owner: HWND,
+    protocol: NetworkProtocol,
+    initial_client_id: &str,
+) -> Option<NetworkResource> {
+    let client_id = configured_cloud_oauth_client_id(protocol, initial_client_id);
+    let Some(client_id) = client_id else {
+        let message = missing_cloud_oauth_configuration_message(protocol);
+        if let Some(app) = app_state_mut(app_owner) {
+            app.nvda.speak(&message);
+        }
+        MessageBoxW(
+            dialog_hwnd,
+            wide(&message).as_ptr(),
+            wide("Brak konfiguracji OAuth").as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+        return None;
+    };
+
+    if let Some(app) = app_state_mut(app_owner) {
+        app.nvda
+            .speak("Otwieram przeglądarkę. Zaloguj się i zaakceptuj dostęp.");
+    }
+    match perform_cloud_oauth(protocol, &client_id) {
+        Ok(resource) => {
+            if let Some(app) = app_state_mut(app_owner) {
+                app.nvda
+                    .speak(&format!("zalogowano {}", resource.effective_display_name()));
+            }
+            Some(resource)
+        }
+        Err(error) => {
+            let message = format!("Nie udało się zalogować: {error}");
+            if let Some(app) = app_state_mut(app_owner) {
+                app.nvda.speak(&message);
+            }
+            MessageBoxW(
+                dialog_hwnd,
+                wide(&message).as_ptr(),
+                wide("Błąd logowania").as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+            None
+        }
+    }
+}
+
+fn configured_cloud_oauth_client_id(
+    protocol: NetworkProtocol,
+    saved_client_id: &str,
+) -> Option<String> {
+    let built_in = built_in_cloud_oauth_client_id(protocol);
+    if !built_in.trim().is_empty() {
+        return Some(built_in.trim().to_string());
+    }
+    let saved_client_id = saved_client_id.trim();
+    if !saved_client_id.is_empty() {
+        return Some(saved_client_id.to_string());
+    }
+    None
+}
+
+fn built_in_cloud_oauth_client_id(protocol: NetworkProtocol) -> &'static str {
+    match protocol {
+        NetworkProtocol::Dropbox => option_env!("AMIGAFM_DROPBOX_APP_KEY").unwrap_or(""),
+        NetworkProtocol::GoogleDrive => option_env!("AMIGAFM_GOOGLE_DRIVE_CLIENT_ID").unwrap_or(""),
+        _ => "",
+    }
+}
+
+fn missing_cloud_oauth_configuration_message(protocol: NetworkProtocol) -> String {
+    match protocol {
+        NetworkProtocol::Dropbox => "Ten instalator Amiga FM nie ma wbudowanego Dropbox App key. To konfiguracja wydania, nie ustawienie użytkownika. Zbuduj program ze zmienną AMIGAFM_DROPBOX_APP_KEY.".to_string(),
+        NetworkProtocol::GoogleDrive => "Ten instalator Amiga FM nie ma wbudowanego Google OAuth Client ID. To konfiguracja wydania, nie ustawienie użytkownika. Zbuduj program ze zmienną AMIGAFM_GOOGLE_DRIVE_CLIENT_ID.".to_string(),
+        _ => "Ten protokół nie obsługuje logowania OAuth.".to_string(),
+    }
 }
 
 unsafe extern "system" fn progress_dialog_proc(
@@ -10138,18 +11539,26 @@ unsafe fn show_network_connection_dialog(
         done: false,
         accepted: false,
         prompt_lines: vec![
-            "Wybierz typ serwera i uzupełnij dane połączenia.".to_string(),
-            "Dane logowania są opcjonalne, jeśli serwer ich nie wymaga.".to_string(),
-            "Klucz SSH dotyczy połączeń SFTP.".to_string(),
+            "Wybierz typ zasobu.".to_string(),
+            "FTP, SFTP, SMB, NFS i WebDAV wymagają danych serwera.".to_string(),
+            "Dropbox i Google Drive uruchomią logowanie w przeglądarce po kliknięciu Dodaj."
+                .to_string(),
+            "Dane konta zostaną pobrane od dostawcy i zapisane w połączeniu.".to_string(),
         ],
         info_hwnd: null_mut(),
         protocol_hwnd: null_mut(),
+        host_label_hwnd: null_mut(),
         host_hwnd: null_mut(),
+        username_label_hwnd: null_mut(),
         username_hwnd: null_mut(),
+        password_label_hwnd: null_mut(),
         password_hwnd: null_mut(),
+        ssh_key_label_hwnd: null_mut(),
         ssh_key_hwnd: null_mut(),
         ssh_key_browse_hwnd: null_mut(),
+        directory_label_hwnd: null_mut(),
         directory_hwnd: null_mut(),
+        display_name_label_hwnd: null_mut(),
         display_name_hwnd: null_mut(),
         anonymous_hwnd: null_mut(),
         ok_hwnd: null_mut(),
@@ -10186,19 +11595,7 @@ unsafe fn show_network_connection_dialog(
         if message.message == WM_KEYDOWN {
             let focused = GetFocus();
             if message.wParam as u32 == 0x09 {
-                let mut order = Vec::with_capacity(12);
-                order.push(state.info_hwnd);
-                order.push(state.protocol_hwnd);
-                order.push(state.host_hwnd);
-                order.push(state.username_hwnd);
-                order.push(state.password_hwnd);
-                order.push(state.anonymous_hwnd);
-                order.push(state.ssh_key_hwnd);
-                order.push(state.ssh_key_browse_hwnd);
-                order.push(state.directory_hwnd);
-                order.push(state.display_name_hwnd);
-                order.push(state.ok_hwnd);
-                order.push(state.cancel_hwnd);
+                let order = network_dialog_tab_order(&state);
                 focus_in_order(&order, focused, shift_pressed());
                 continue;
             }
@@ -13254,6 +14651,10 @@ fn connect_remote_client(resource: &NetworkResource) -> io::Result<RemoteClient>
             "SMB jest obsługiwane przez ścieżkę sieciową Windows",
         )),
         NetworkProtocol::Nfs => Ok(RemoteClient::Nfs(NfsSession::new(resource.clone())?)),
+        NetworkProtocol::Dropbox => Ok(RemoteClient::Dropbox(DropboxClient::new(resource)?)),
+        NetworkProtocol::GoogleDrive => {
+            Ok(RemoteClient::GoogleDrive(GoogleDriveClient::new(resource)?))
+        }
     }
 }
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Dodano
+
+- Testową obsługę Dropbox i Google Drive jako zasobów sieciowych.
+- Logowanie OAuth dla Dropbox i Google Drive z otwarciem przeglądarki systemowej, lokalnym callbackiem `127.0.0.1` i PKCE.
+- Ukrywanie pól serwerowych w dialogu połączenia po wybraniu Dropbox albo Google Drive.
+- Dropbox przez API v2: listowanie, pobieranie, wysyłanie, tworzenie folderów, usuwanie i przenoszenie.
+- Google Drive przez Drive API v3: ścieżkowy dostęp do plików i folderów, pobieranie, wysyłanie, tworzenie folderów, usuwanie i przenoszenie.
+
+### Znane ograniczenia
+
+- Dropbox i Google Drive wymagają wbudowania identyfikatora aplikacji OAuth przez wydawcę builda.
+- Dropbox wymaga dodania redirect URI `http://127.0.0.1:53682/callback` w konsoli aplikacji.
+- Pliki Google Workspace wymagające eksportu nie są jeszcze pobierane.
+- Nazwy z ukośnikiem w Google Drive nie są jeszcze mapowane na bezpieczne nazwy panelu.
+
 ## 0.1.1 - 2026-04-24
 
 ### Zmieniono
