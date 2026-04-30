@@ -13,7 +13,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use libloading::Library;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use netdev::get_interfaces;
 use netdev::interface::state::OperState;
@@ -37,8 +38,12 @@ use remotefs::{File as RemoteFile, RemoteFs};
 use remotefs_ftp::FtpFs;
 use remotefs_ssh::{NoCheckServerKey, RusshSession, SftpFs, SshKeyStorage, SshOpts};
 use remotefs_webdav::WebDAVFs;
+use reqwest::blocking::{Client as HttpClient, Response as HttpResponse};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT};
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream as TokioTcpStream;
+use url::Url;
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, GetLastError, GlobalFree, HWND, LPARAM, LRESULT, LocalFree, RECT,
     SYSTEMTIME, WPARAM,
@@ -100,8 +105,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IDI_APPLICATION, IsDialogMessageW, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
     LB_SETTOPINDEX, LBN_DBLCLK, LBN_SELCHANGE, LBN_SETFOCUS, LBS_NOTIFY, LoadCursorW, LoadIconW,
     MB_ICONERROR, MB_OK, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
-    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_MAXIMIZE, SW_SHOW,
-    SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TPM_LEFTALIGN,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_MAXIMIZE,
+    SW_SHOW, SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TPM_LEFTALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenu, TrackPopupMenuEx,
     TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETDLGCODE, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY,
@@ -151,6 +156,7 @@ const IDM_CREATE_ARCHIVE: u16 = 2031;
 const IDM_JOIN_SPLIT_ARCHIVE: u16 = 2032;
 const IDM_CHECKSUM_CREATE: u16 = 2033;
 const IDM_CHECKSUM_VERIFY: u16 = 2034;
+const IDM_MEDIA_PREVIEW: u16 = 2035;
 
 const ID_DIALOG_EDIT: i32 = 3001;
 const ID_DIALOG_OK: i32 = 3002;
@@ -180,6 +186,18 @@ const ID_ARCHIVE_ENCRYPTED: i32 = 3033;
 const ID_ARCHIVE_ENCRYPTION: i32 = 3034;
 const ID_ARCHIVE_PASSWORD: i32 = 3035;
 const ID_ARCHIVE_VOLUME: i32 = 3036;
+const ID_PERM_MODE: i32 = 3040;
+const ID_PERM_OWNER: i32 = 3041;
+const ID_PERM_RECURSIVE: i32 = 3042;
+const ID_PERM_OWNER_READ: i32 = 3043;
+const ID_PERM_OWNER_WRITE: i32 = 3044;
+const ID_PERM_OWNER_EXECUTE: i32 = 3045;
+const ID_PERM_GROUP_READ: i32 = 3046;
+const ID_PERM_GROUP_WRITE: i32 = 3047;
+const ID_PERM_GROUP_EXECUTE: i32 = 3048;
+const ID_PERM_OTHER_READ: i32 = 3049;
+const ID_PERM_OTHER_WRITE: i32 = 3050;
+const ID_PERM_OTHER_EXECUTE: i32 = 3051;
 
 const WM_PANEL_ACTION: u32 = WM_APP + 1;
 const WM_PANEL_SEARCH: u32 = WM_APP + 2;
@@ -188,6 +206,7 @@ const WM_PROGRESS_EVENT: u32 = WM_APP + 4;
 const WM_PROGRESS_NAVIGATE: u32 = WM_APP + 5;
 const WM_DIALOG_NAVIGATE: u32 = WM_APP + 6;
 const WM_SEARCH_EVENT: u32 = WM_APP + 7;
+const WM_MEDIA_PREVIEW_EVENT: u32 = WM_APP + 8;
 const WM_CUT_MSG: u32 = 0x0300;
 const WM_COPY_MSG: u32 = 0x0301;
 const WM_PASTE_MSG: u32 = 0x0302;
@@ -200,6 +219,7 @@ const PROGRESS_DIALOG_CLASS: &str = "AmigaFmNativeProgressDialog";
 const NETWORK_DIALOG_CLASS: &str = "AmigaFmNativeNetworkDialog";
 const DISCOVERY_DIALOG_CLASS: &str = "AmigaFmNativeDiscoveryDialog";
 const ARCHIVE_CREATE_DIALOG_CLASS: &str = "AmigaFmNativeArchiveCreateDialog";
+const SFTP_PERMISSIONS_DIALOG_CLASS: &str = "AmigaFmNativeSftpPermissionsDialog";
 
 const BLACK: u32 = rgb(0, 0, 0);
 const YELLOW: u32 = rgb(255, 220, 0);
@@ -407,6 +427,8 @@ enum NetworkProtocol {
     Ftps,
     Nfs,
     WebDav,
+    Http,
+    Https,
     Smb,
 }
 
@@ -417,12 +439,14 @@ impl Default for NetworkProtocol {
 }
 
 impl NetworkProtocol {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Sftp,
         Self::Ftp,
         Self::Ftps,
         Self::Nfs,
         Self::WebDav,
+        Self::Http,
+        Self::Https,
         Self::Smb,
     ];
 
@@ -433,6 +457,8 @@ impl NetworkProtocol {
             Self::Ftps => "FTPS",
             Self::Nfs => "NFS",
             Self::WebDav => "WebDAV",
+            Self::Http => "HTTP",
+            Self::Https => "HTTPS",
             Self::Smb => "SMB",
         }
     }
@@ -444,6 +470,8 @@ impl NetworkProtocol {
             Self::Ftps => "zasób FTPS",
             Self::Nfs => "zasób NFS",
             Self::WebDav => "zasób WebDAV",
+            Self::Http => "zasób HTTP tylko do odczytu",
+            Self::Https => "zasób HTTPS tylko do odczytu",
             Self::Smb => "zasób SMB",
         }
     }
@@ -478,6 +506,7 @@ enum RemoteClient {
     Ftp(FtpFs),
     Sftp(SftpFs<RusshSession<NoCheckServerKey>>),
     WebDav(WebDAVFs),
+    Http(HttpSession),
     Nfs(NfsSession),
 }
 
@@ -653,6 +682,165 @@ impl NfsSession {
     }
 }
 
+struct HttpSession {
+    resource: NetworkResource,
+    client: HttpClient,
+    base_url: Url,
+}
+
+impl HttpSession {
+    fn new(resource: NetworkResource) -> io::Result<Self> {
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(45))
+            .build()
+            .map_err(reqwest_error_to_io)?;
+        let base_url = normalize_http_base_url(&resource)?;
+        Ok(Self {
+            resource,
+            client,
+            base_url,
+        })
+    }
+
+    fn connect(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {}
+
+    fn request(&self, method: Method, url: Url) -> io::Result<HttpResponse> {
+        let mut request = self
+            .client
+            .request(method, url)
+            .header(USER_AGENT, "AmigaFM/0.1");
+        if !self.resource.anonymous
+            && (!self.resource.username.trim().is_empty() || !self.resource.password.is_empty())
+        {
+            request = request.basic_auth(
+                self.resource.username.trim().to_string(),
+                Some(self.resource.password.clone()),
+            );
+        }
+        let response = request.send().map_err(reqwest_error_to_io)?;
+        ensure_http_success(response)
+    }
+
+    fn url_for_path(&self, path: &Path, directory: bool) -> io::Result<Url> {
+        let relative = remote_shell_path(path)
+            .trim()
+            .trim_start_matches('/')
+            .replace('\\', "/");
+        if relative.is_empty() {
+            return Ok(self.base_url.clone());
+        }
+        let encoded = encode_uri_path(&relative);
+        let relative = if directory {
+            format!("{}/", encoded.trim_end_matches('/'))
+        } else {
+            encoded
+        };
+        self.base_url
+            .join(&relative)
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn list_dir(&mut self, path: &Path) -> io::Result<Vec<RemoteFile>> {
+        let url = self.url_for_path(path, true)?;
+        let response = self.request(Method::GET, url.clone())?;
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_lowercase();
+        let body = response.text().map_err(reqwest_error_to_io)?;
+        if !content_type.is_empty()
+            && !content_type.contains("text/html")
+            && !content_type.contains("application/xhtml")
+        {
+            return Err(io::Error::other(
+                "serwer HTTP nie zwrócił listingu HTML katalogu",
+            ));
+        }
+        let entries = parse_http_directory_listing(&body, &url, &self.base_url)?;
+        if entries.is_empty() {
+            return Err(io::Error::other(
+                "nie znaleziono linków w listingu katalogu HTTP",
+            ));
+        }
+        Ok(entries)
+    }
+
+    fn stat(&mut self, path: &Path) -> io::Result<RemoteFile> {
+        if path == Path::new("/") || path.as_os_str().is_empty() {
+            return Ok(RemoteFile {
+                path: PathBuf::from("/"),
+                metadata: RemoteMetadata::default().file_type(RemoteFileType::Directory),
+            });
+        }
+
+        let url = self.url_for_path(path, false)?;
+        let response = match self.request(Method::HEAD, url.clone()) {
+            Ok(response) => response,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                self.request(Method::GET, url.clone())?
+            }
+            Err(error) => return Err(error),
+        };
+        let size = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok(RemoteFile {
+            path: path.to_path_buf(),
+            metadata: RemoteMetadata::default()
+                .file_type(RemoteFileType::File)
+                .size(size),
+        })
+    }
+
+    fn exists(&mut self, path: &Path) -> io::Result<bool> {
+        match self.stat(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn create_dir(&mut self, _path: &Path) -> io::Result<()> {
+        Err(http_read_only_error())
+    }
+
+    fn rename(&mut self, _src: &Path, _dest: &Path) -> io::Result<()> {
+        Err(http_read_only_error())
+    }
+
+    fn remove_file(&mut self, _path: &Path) -> io::Result<()> {
+        Err(http_read_only_error())
+    }
+
+    fn remove_dir(&mut self, _path: &Path) -> io::Result<()> {
+        Err(http_read_only_error())
+    }
+
+    fn download_to(&mut self, src: &Path, mut dest: Box<dyn Write + Send>) -> io::Result<u64> {
+        let url = self.url_for_path(src, false)?;
+        let mut response = self.request(Method::GET, url)?;
+        io::copy(&mut response, &mut dest)
+    }
+
+    fn create_file(
+        &mut self,
+        _path: &Path,
+        _metadata: &RemoteMetadata,
+        _reader: Box<dyn Read + Send>,
+    ) -> io::Result<u64> {
+        Err(http_read_only_error())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct PersistedNetworkResource {
@@ -751,6 +939,8 @@ impl NetworkResource {
             NetworkProtocol::Sftp => build_network_uri("sftp", &host, directory, self),
             NetworkProtocol::Ftp => build_network_uri("ftp", &host, directory, self),
             NetworkProtocol::Ftps => build_network_uri("ftps", &host, directory, self),
+            NetworkProtocol::Http => build_http_network_uri("http", &host, directory),
+            NetworkProtocol::Https => build_http_network_uri("https", &host, directory),
             NetworkProtocol::WebDav => {
                 let scheme = if host.starts_with("https://") {
                     "https"
@@ -778,6 +968,8 @@ impl NetworkResource {
                 | NetworkProtocol::Ftps
                 | NetworkProtocol::Nfs
                 | NetworkProtocol::WebDav
+                | NetworkProtocol::Http
+                | NetworkProtocol::Https
         ) {
             Some(RemoteLocation {
                 resource: self.clone(),
@@ -905,6 +1097,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.connect().map(|_| ()).map_err(remote_error_to_io),
             Self::Sftp(client) => client.connect().map(|_| ()).map_err(remote_error_to_io),
             Self::WebDav(client) => client.connect().map(|_| ()).map_err(remote_error_to_io),
+            Self::Http(client) => client.connect(),
             Self::Nfs(client) => client.connect(),
         }
     }
@@ -914,6 +1107,10 @@ impl RemoteClient {
             Self::Ftp(client) => client.disconnect(),
             Self::Sftp(client) => client.disconnect(),
             Self::WebDav(client) => client.disconnect(),
+            Self::Http(client) => {
+                client.disconnect();
+                Ok(())
+            }
             Self::Nfs(client) => {
                 client.disconnect();
                 Ok(())
@@ -926,6 +1123,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.list_dir(path).map_err(remote_error_to_io),
             Self::Sftp(client) => client.list_dir(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.list_dir(path).map_err(remote_error_to_io),
+            Self::Http(client) => client.list_dir(path),
             Self::Nfs(client) => client.list_dir(path),
         }
     }
@@ -935,6 +1133,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.stat(path).map_err(remote_error_to_io),
             Self::Sftp(client) => client.stat(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.stat(path).map_err(remote_error_to_io),
+            Self::Http(client) => client.stat(path),
             Self::Nfs(client) => client.stat(path),
         }
     }
@@ -944,6 +1143,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.exists(path).map_err(remote_error_to_io),
             Self::Sftp(client) => client.exists(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.exists(path).map_err(remote_error_to_io),
+            Self::Http(client) => client.exists(path),
             Self::Nfs(client) => client.exists(path),
         }
     }
@@ -959,6 +1159,7 @@ impl RemoteClient {
             Self::WebDav(client) => client
                 .create_dir(path, UnixPex::from(0o755))
                 .map_err(remote_error_to_io),
+            Self::Http(client) => client.create_dir(path),
             Self::Nfs(client) => client.create_dir(path),
         }
     }
@@ -968,6 +1169,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.mov(src, dest).map_err(remote_error_to_io),
             Self::Sftp(client) => client.mov(src, dest).map_err(remote_error_to_io),
             Self::WebDav(client) => client.mov(src, dest).map_err(remote_error_to_io),
+            Self::Http(client) => client.rename(src, dest),
             Self::Nfs(client) => client.rename(src, dest),
         }
     }
@@ -977,6 +1179,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.remove_file(path).map_err(remote_error_to_io),
             Self::Sftp(client) => client.remove_file(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.remove_file(path).map_err(remote_error_to_io),
+            Self::Http(client) => client.remove_file(path),
             Self::Nfs(client) => client.remove_file(path),
         }
     }
@@ -986,6 +1189,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.remove_dir(path).map_err(remote_error_to_io),
             Self::Sftp(client) => client.remove_dir(path).map_err(remote_error_to_io),
             Self::WebDav(client) => client.remove_dir(path).map_err(remote_error_to_io),
+            Self::Http(client) => client.remove_dir(path),
             Self::Nfs(client) => client.remove_dir(path),
         }
     }
@@ -995,6 +1199,7 @@ impl RemoteClient {
             Self::Ftp(client) => client.open_file(src, dest).map_err(remote_error_to_io),
             Self::Sftp(client) => client.open_file(src, dest).map_err(remote_error_to_io),
             Self::WebDav(client) => client.open_file(src, dest).map_err(remote_error_to_io),
+            Self::Http(client) => client.download_to(src, dest),
             Self::Nfs(client) => client.download_to(src, dest),
         }
     }
@@ -1015,6 +1220,7 @@ impl RemoteClient {
             Self::WebDav(client) => client
                 .create_file(path, metadata, reader)
                 .map_err(remote_error_to_io),
+            Self::Http(client) => client.create_file(path, metadata, reader),
             Self::Nfs(client) => client.create_file(path, metadata, reader),
         }
     }
@@ -1871,6 +2077,7 @@ enum PanelAction {
     ExitSearch,
     MarkByExtension,
     MarkByName,
+    MediaPreview,
 }
 
 impl PanelAction {
@@ -1899,6 +2106,7 @@ impl PanelAction {
             21 => Some(Self::ExitSearch),
             22 => Some(Self::MarkByExtension),
             23 => Some(Self::MarkByName),
+            24 => Some(Self::MediaPreview),
             _ => None,
         }
     }
@@ -1928,6 +2136,7 @@ impl PanelAction {
             Self::ExitSearch => 21,
             Self::MarkByExtension => 22,
             Self::MarkByName => 23,
+            Self::MediaPreview => 24,
         }
     }
 }
@@ -2000,11 +2209,34 @@ struct NetworkDialogState {
     host_hwnd: HWND,
     username_hwnd: HWND,
     password_hwnd: HWND,
+    ssh_key_label_hwnd: HWND,
     ssh_key_hwnd: HWND,
     ssh_key_browse_hwnd: HWND,
     directory_hwnd: HWND,
     display_name_hwnd: HWND,
     anonymous_hwnd: HWND,
+    ok_hwnd: HWND,
+    cancel_hwnd: HWND,
+}
+
+#[derive(Clone)]
+struct SftpPermissionChange {
+    mode: Option<String>,
+    owner: Option<String>,
+    recursive: bool,
+}
+
+struct SftpPermissionsDialogState {
+    owner: HWND,
+    result: Option<SftpPermissionChange>,
+    done: bool,
+    accepted: bool,
+    prompt_lines: Vec<String>,
+    info_hwnd: HWND,
+    mode_hwnd: HWND,
+    owner_hwnd: HWND,
+    recursive_hwnd: HWND,
+    permission_hwnds: [HWND; 9],
     ok_hwnd: HWND,
     cancel_hwnd: HWND,
 }
@@ -2228,6 +2460,55 @@ struct SearchMessage {
     error: Option<String>,
 }
 
+#[derive(Clone)]
+enum MediaPreviewSource {
+    Local {
+        path: PathBuf,
+        name: String,
+    },
+    Remote {
+        remote: RemoteLocation,
+        path: PathBuf,
+        name: String,
+        stream_url: Option<String>,
+    },
+}
+
+enum PreparedMediaPreview {
+    File {
+        path: PathBuf,
+        temp_path: Option<PathBuf>,
+    },
+    Url(String),
+}
+
+enum MediaPreviewCommand {
+    Play {
+        id: u64,
+        source: MediaPreviewSource,
+        cancel_flag: Arc<AtomicBool>,
+    },
+    Stop,
+    Shutdown,
+}
+
+enum MediaPreviewEvent {
+    Started { id: u64, name: String },
+    Finished { id: u64 },
+    Error { id: u64, message: String },
+}
+
+struct MediaPreviewController {
+    sender: Sender<MediaPreviewCommand>,
+    receiver: Receiver<MediaPreviewEvent>,
+    current_id: Option<u64>,
+    current_cancel: Option<Arc<AtomicBool>>,
+    current_signature: Option<String>,
+    next_id: u64,
+    enabled: bool,
+    active: bool,
+}
+
 struct AppState {
     hwnd: HWND,
     panels: [PanelModel; 2],
@@ -2245,6 +2526,7 @@ struct AppState {
     view_options: ViewOptions,
     discovery_cache: DiscoveryCache,
     clipboard: Option<AppClipboardState>,
+    media_preview: Option<MediaPreviewController>,
 }
 
 #[repr(C)]
@@ -2318,6 +2600,659 @@ struct ElevatedLocalRequestFile {
     error: Option<String>,
 }
 
+impl MediaPreviewSource {
+    fn name(&self) -> &str {
+        match self {
+            Self::Local { name, .. } | Self::Remote { name, .. } => name,
+        }
+    }
+
+    fn signature(&self) -> String {
+        match self {
+            Self::Local { path, .. } => format!("local:{}", path.display()),
+            Self::Remote { remote, path, .. } => {
+                format!("remote:{}:{}", remote.resource.stable_key(), path.display())
+            }
+        }
+    }
+}
+
+impl MediaPreviewController {
+    fn start(hwnd: HWND) -> Self {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let hwnd = hwnd as usize;
+        thread::spawn(move || media_preview_worker(command_receiver, event_sender, hwnd));
+        Self {
+            sender: command_sender,
+            receiver: event_receiver,
+            current_id: None,
+            current_cancel: None,
+            current_signature: None,
+            next_id: 1,
+            enabled: false,
+            active: false,
+        }
+    }
+
+    fn play(&mut self, source: MediaPreviewSource) -> u64 {
+        self.stop_without_event();
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let signature = source.signature();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let _ = self.sender.send(MediaPreviewCommand::Play {
+            id,
+            source,
+            cancel_flag: cancel_flag.clone(),
+        });
+        self.current_id = Some(id);
+        self.current_cancel = Some(cancel_flag);
+        self.current_signature = Some(signature);
+        self.enabled = true;
+        self.active = true;
+        id
+    }
+
+    fn stop(&mut self) {
+        self.enabled = false;
+        self.stop_current();
+    }
+
+    fn stop_current(&mut self) {
+        self.stop_without_event();
+        let _ = self.sender.send(MediaPreviewCommand::Stop);
+    }
+
+    fn stop_without_event(&mut self) {
+        if let Some(cancel) = &self.current_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.current_id = None;
+        self.current_cancel = None;
+        self.current_signature = None;
+        self.active = false;
+    }
+
+    fn shutdown(&mut self) {
+        self.enabled = false;
+        self.stop_without_event();
+        let _ = self.sender.send(MediaPreviewCommand::Shutdown);
+    }
+
+    fn drain_events(&mut self) -> Vec<MediaPreviewEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn accepts_event(&self, id: u64) -> bool {
+        self.current_id == Some(id)
+    }
+
+    fn mark_finished(&mut self, id: u64) {
+        if self.current_id == Some(id) {
+            self.current_id = None;
+            self.current_cancel = None;
+            self.current_signature = None;
+            self.active = false;
+        }
+    }
+}
+
+type BassBool = i32;
+type BassDword = u32;
+type BassHandle = u32;
+type BassQword = u64;
+type BassInit =
+    unsafe extern "system" fn(i32, BassDword, BassDword, HWND, *const c_void) -> BassBool;
+type BassFree = unsafe extern "system" fn() -> BassBool;
+type BassStreamCreateFile = unsafe extern "system" fn(
+    BassBool,
+    *const c_void,
+    BassQword,
+    BassQword,
+    BassDword,
+) -> BassHandle;
+type BassStreamCreateUrl = unsafe extern "system" fn(
+    *const c_void,
+    BassQword,
+    BassDword,
+    *const c_void,
+    *const c_void,
+) -> BassHandle;
+type BassStreamFree = unsafe extern "system" fn(BassHandle) -> BassBool;
+type BassChannelPlay = unsafe extern "system" fn(BassHandle, BassBool) -> BassBool;
+type BassChannelStop = unsafe extern "system" fn(BassHandle) -> BassBool;
+type BassChannelIsActive = unsafe extern "system" fn(BassHandle) -> BassDword;
+type BassErrorGetCode = unsafe extern "system" fn() -> i32;
+type BassPluginLoad = unsafe extern "system" fn(*const c_void, BassDword) -> BassHandle;
+type BassPluginFree = unsafe extern "system" fn(BassHandle) -> BassBool;
+
+const BASS_UNICODE: BassDword = 0x8000_0000;
+const BASS_ACTIVE_STOPPED: BassDword = 0;
+
+struct BassRuntime {
+    _library: Library,
+    plugins: Vec<BassHandle>,
+    free: BassFree,
+    stream_create_file: BassStreamCreateFile,
+    stream_create_url: BassStreamCreateUrl,
+    stream_free: BassStreamFree,
+    channel_play: BassChannelPlay,
+    channel_stop: BassChannelStop,
+    channel_is_active: BassChannelIsActive,
+    error_get_code: BassErrorGetCode,
+    plugin_free: BassPluginFree,
+}
+
+impl BassRuntime {
+    unsafe fn load() -> io::Result<Self> {
+        let (library, library_path) = load_bass_library()?;
+        let init: BassInit = load_bass_symbol(&library, b"BASS_Init\0")?;
+        let free: BassFree = load_bass_symbol(&library, b"BASS_Free\0")?;
+        let stream_create_file: BassStreamCreateFile =
+            load_bass_symbol(&library, b"BASS_StreamCreateFile\0")?;
+        let stream_create_url: BassStreamCreateUrl =
+            load_bass_symbol(&library, b"BASS_StreamCreateURL\0")?;
+        let stream_free: BassStreamFree = load_bass_symbol(&library, b"BASS_StreamFree\0")?;
+        let channel_play: BassChannelPlay = load_bass_symbol(&library, b"BASS_ChannelPlay\0")?;
+        let channel_stop: BassChannelStop = load_bass_symbol(&library, b"BASS_ChannelStop\0")?;
+        let channel_is_active: BassChannelIsActive =
+            load_bass_symbol(&library, b"BASS_ChannelIsActive\0")?;
+        let error_get_code: BassErrorGetCode = load_bass_symbol(&library, b"BASS_ErrorGetCode\0")?;
+        let plugin_load: BassPluginLoad = load_bass_symbol(&library, b"BASS_PluginLoad\0")?;
+        let plugin_free: BassPluginFree = load_bass_symbol(&library, b"BASS_PluginFree\0")?;
+
+        if init(-1, 44_100, 0, null_mut(), null()) == 0 {
+            let code = error_get_code();
+            return Err(io::Error::other(format!(
+                "BASS_Init: {}",
+                bass_error_message(code)
+            )));
+        }
+
+        let mut runtime = Self {
+            _library: library,
+            plugins: Vec::new(),
+            free,
+            stream_create_file,
+            stream_create_url,
+            stream_free,
+            channel_play,
+            channel_stop,
+            channel_is_active,
+            error_get_code,
+            plugin_free,
+        };
+        runtime.load_plugins_near(&library_path, plugin_load);
+        Ok(runtime)
+    }
+
+    unsafe fn load_plugins_near(&mut self, library_path: &Path, plugin_load: BassPluginLoad) {
+        let Some(directory) = library_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        else {
+            return;
+        };
+        for name in [
+            "bass_aac.dll",
+            "bassalac.dll",
+            "bassape.dll",
+            "bass_aac.dll",
+            "bass_ac3.dll",
+            "bassdsd.dll",
+            "bassflac.dll",
+            "basshls.dll",
+            "bassmidi.dll",
+            "bass_mpc.dll",
+            "bassopus.dll",
+            "bass_spx.dll",
+            "bass_tta.dll",
+            "basswebm.dll",
+            "basswma.dll",
+            "basswv.dll",
+            "bassmix.dll",
+            "bass_fx.dll",
+        ] {
+            let path = directory.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let wide_path = path_wide(&path);
+            let handle = plugin_load(wide_path.as_ptr() as *const c_void, BASS_UNICODE);
+            if handle != 0 {
+                self.plugins.push(handle);
+            }
+        }
+    }
+
+    unsafe fn play_file(&self, path: &Path) -> io::Result<BassHandle> {
+        let wide_path = path_wide(path);
+        let stream =
+            (self.stream_create_file)(0, wide_path.as_ptr() as *const c_void, 0, 0, BASS_UNICODE);
+        if stream == 0 {
+            let code = (self.error_get_code)();
+            return Err(io::Error::other(format!(
+                "BASS nie otworzył pliku: {}",
+                bass_error_message(code)
+            )));
+        }
+        if (self.channel_play)(stream, 1) == 0 {
+            let code = (self.error_get_code)();
+            let _ = (self.stream_free)(stream);
+            return Err(io::Error::other(format!(
+                "BASS nie uruchomił odtwarzania: {}",
+                bass_error_message(code)
+            )));
+        }
+        Ok(stream)
+    }
+
+    unsafe fn play_url(&self, url: &str) -> io::Result<BassHandle> {
+        let wide_url = wide(url);
+        let stream = (self.stream_create_url)(
+            wide_url.as_ptr() as *const c_void,
+            0,
+            BASS_UNICODE,
+            null(),
+            null(),
+        );
+        if stream == 0 {
+            let code = (self.error_get_code)();
+            return Err(io::Error::other(format!(
+                "BASS nie otworzył strumienia: {}",
+                bass_error_message(code)
+            )));
+        }
+        if (self.channel_play)(stream, 1) == 0 {
+            let code = (self.error_get_code)();
+            let _ = (self.stream_free)(stream);
+            return Err(io::Error::other(format!(
+                "BASS nie uruchomił strumienia: {}",
+                bass_error_message(code)
+            )));
+        }
+        Ok(stream)
+    }
+
+    unsafe fn stop_stream(&self, stream: BassHandle) {
+        let _ = (self.channel_stop)(stream);
+        let _ = (self.stream_free)(stream);
+    }
+
+    unsafe fn is_stream_stopped(&self, stream: BassHandle) -> bool {
+        (self.channel_is_active)(stream) == BASS_ACTIVE_STOPPED
+    }
+
+    unsafe fn shutdown(&self) {
+        for plugin in &self.plugins {
+            let _ = (self.plugin_free)(*plugin);
+        }
+        let _ = (self.free)();
+    }
+}
+
+unsafe fn load_bass_symbol<T: Copy>(library: &Library, name: &[u8]) -> io::Result<T> {
+    library
+        .get::<T>(name)
+        .map(|symbol| *symbol)
+        .map_err(|error| io::Error::other(format!("brak funkcji BASS: {error}")))
+}
+
+unsafe fn load_bass_library() -> io::Result<(Library, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("AMIGAFM_BASS_DLL") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("bass.dll"));
+            candidates.push(dir.join("bass").join("bass.dll"));
+        }
+    }
+    candidates.push(PathBuf::from("bass.dll"));
+    candidates.push(PathBuf::from(r"C:\nvgt\lib\bass.dll"));
+    candidates.push(PathBuf::from(r"C:\Program Files\FastPlay\lib\bass.dll"));
+
+    let mut last_error = None;
+    for candidate in candidates {
+        if candidate.is_absolute() && !candidate.exists() {
+            continue;
+        }
+        match Library::new(&candidate) {
+            Ok(library) => return Ok((library, candidate)),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "nie znaleziono bass.dll. Umieść bass.dll obok amiga_fm.exe albo ustaw AMIGAFM_BASS_DLL.{}",
+            last_error
+                .map(|error| format!(" Ostatni błąd: {error}"))
+                .unwrap_or_default()
+        ),
+    ))
+}
+
+fn bass_error_message(code: i32) -> String {
+    let description = match code {
+        0 => "brak błędu",
+        2 => "brak pamięci",
+        3 => "nie można otworzyć pliku",
+        5 => "nieprawidłowy uchwyt",
+        6 => "nieobsługiwany format wyjścia",
+        8 => "BASS nie został zainicjalizowany",
+        14 => "nieznany błąd",
+        20 => "problem z urządzeniem audio",
+        21 => "urządzenie nie odtwarza",
+        32 => "nie można utworzyć strumienia",
+        37 => "funkcja niedostępna",
+        38 => "strumień jest dekodujący, nie odtwarzający",
+        40 => "przekroczono limit czasu",
+        41 => "BASS lub jego pluginy nie obsługują formatu pliku",
+        43 => "niezgodna wersja biblioteki BASS",
+        44 => "brak kodeka dla tego formatu",
+        -1 => "nieznany błąd",
+        _ => "błąd BASS",
+    };
+    format!("{description} ({code})")
+}
+
+struct CancelableFileWriter {
+    file: fs::File,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl CancelableFileWriter {
+    fn new(file: fs::File, cancel_flag: Arc<AtomicBool>) -> Self {
+        Self { file, cancel_flag }
+    }
+}
+
+impl Write for CancelableFileWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.cancel_flag.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "anulowano"));
+        }
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn media_preview_worker(
+    command_receiver: Receiver<MediaPreviewCommand>,
+    event_sender: Sender<MediaPreviewEvent>,
+    hwnd: usize,
+) {
+    let mut bass = None::<BassRuntime>;
+    let mut current_stream = None::<BassHandle>;
+    let mut current_process = None::<Child>;
+    let mut current_temp = None::<PathBuf>;
+    let mut current_id = None::<u64>;
+
+    let send_event = |event: MediaPreviewEvent| {
+        let _ = event_sender.send(event);
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_MEDIA_PREVIEW_EVENT, 0, 0);
+        }
+    };
+
+    let stop_current = |bass: &Option<BassRuntime>,
+                        stream: &mut Option<BassHandle>,
+                        process: &mut Option<Child>,
+                        temp: &mut Option<PathBuf>| {
+        if let (Some(runtime), Some(handle)) = (bass.as_ref(), stream.take()) {
+            unsafe {
+                runtime.stop_stream(handle);
+            }
+        }
+        if let Some(mut child) = process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(path) = temp.take() {
+            let _ = fs::remove_file(path);
+        }
+    };
+
+    loop {
+        match command_receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(MediaPreviewCommand::Play {
+                id,
+                source,
+                cancel_flag,
+            }) => {
+                stop_current(
+                    &bass,
+                    &mut current_stream,
+                    &mut current_process,
+                    &mut current_temp,
+                );
+                current_id = Some(id);
+                match prepare_media_preview_source(&source, cancel_flag.clone()) {
+                    Ok(prepared) => {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            if let PreparedMediaPreview::File {
+                                temp_path: Some(path),
+                                ..
+                            } = prepared
+                            {
+                                let _ = fs::remove_file(path);
+                            }
+                            send_event(MediaPreviewEvent::Finished { id });
+                            current_id = None;
+                            continue;
+                        }
+                        let mut bass_error = None::<String>;
+                        if bass.is_none() {
+                            match unsafe { BassRuntime::load() } {
+                                Ok(runtime) => bass = Some(runtime),
+                                Err(error) => bass_error = Some(error.to_string()),
+                            }
+                        }
+                        let mut started = false;
+                        if let Some(runtime) = bass.as_ref() {
+                            let play_result = match &prepared {
+                                PreparedMediaPreview::File { path, .. } => unsafe {
+                                    runtime.play_file(path)
+                                },
+                                PreparedMediaPreview::Url(url) => unsafe { runtime.play_url(url) },
+                            };
+                            match play_result {
+                                Ok(stream) => {
+                                    current_stream = Some(stream);
+                                    current_temp = match &prepared {
+                                        PreparedMediaPreview::File { temp_path, .. } => {
+                                            temp_path.clone()
+                                        }
+                                        PreparedMediaPreview::Url(_) => None,
+                                    };
+                                    started = true;
+                                    send_event(MediaPreviewEvent::Started {
+                                        id,
+                                        name: source.name().to_string(),
+                                    });
+                                }
+                                Err(error) => bass_error = Some(error.to_string()),
+                            }
+                        }
+                        if !started {
+                            let target = match &prepared {
+                                PreparedMediaPreview::File { path, .. } => {
+                                    path.display().to_string()
+                                }
+                                PreparedMediaPreview::Url(url) => url.clone(),
+                            };
+                            match start_hidden_media_process_target(&target) {
+                                Ok(child) => {
+                                    current_process = Some(child);
+                                    current_temp = match prepared {
+                                        PreparedMediaPreview::File { temp_path, .. } => temp_path,
+                                        PreparedMediaPreview::Url(_) => None,
+                                    };
+                                    send_event(MediaPreviewEvent::Started {
+                                        id,
+                                        name: source.name().to_string(),
+                                    });
+                                }
+                                Err(error) => {
+                                    if let PreparedMediaPreview::File {
+                                        temp_path: Some(path),
+                                        ..
+                                    } = prepared
+                                    {
+                                        let _ = fs::remove_file(path);
+                                    }
+                                    let message = match bass_error {
+                                        Some(bass_error) => {
+                                            format!("{bass_error}; fallback ffplay/mpv: {error}")
+                                        }
+                                        None => error.to_string(),
+                                    };
+                                    send_event(MediaPreviewEvent::Error { id, message });
+                                    current_id = None;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        send_event(MediaPreviewEvent::Finished { id });
+                        current_id = None;
+                    }
+                    Err(error) => {
+                        send_event(MediaPreviewEvent::Error {
+                            id,
+                            message: error.to_string(),
+                        });
+                        current_id = None;
+                    }
+                }
+            }
+            Ok(MediaPreviewCommand::Stop) => {
+                stop_current(
+                    &bass,
+                    &mut current_stream,
+                    &mut current_process,
+                    &mut current_temp,
+                );
+                current_id = None;
+            }
+            Ok(MediaPreviewCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stop_current(
+                    &bass,
+                    &mut current_stream,
+                    &mut current_process,
+                    &mut current_temp,
+                );
+                if let Some(runtime) = &bass {
+                    unsafe {
+                        runtime.shutdown();
+                    }
+                }
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let (Some(runtime), Some(stream), Some(id)) =
+                    (bass.as_ref(), current_stream, current_id)
+                {
+                    if unsafe { runtime.is_stream_stopped(stream) } {
+                        stop_current(
+                            &bass,
+                            &mut current_stream,
+                            &mut current_process,
+                            &mut current_temp,
+                        );
+                        current_id = None;
+                        send_event(MediaPreviewEvent::Finished { id });
+                    }
+                }
+                if let (Some(child), Some(id)) = (current_process.as_mut(), current_id) {
+                    if child.try_wait().ok().flatten().is_some() {
+                        stop_current(
+                            &bass,
+                            &mut current_stream,
+                            &mut current_process,
+                            &mut current_temp,
+                        );
+                        current_id = None;
+                        send_event(MediaPreviewEvent::Finished { id });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn start_hidden_media_process_target(target: &str) -> io::Result<Child> {
+    let ffplay_result = Command::new("ffplay.exe")
+        .arg("-nodisp")
+        .arg("-autoexit")
+        .arg("-loglevel")
+        .arg("quiet")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW_FLAG)
+        .spawn();
+    match ffplay_result {
+        Ok(child) => return Ok(child),
+        Err(ffplay_error) => {
+            let mpv_result = Command::new("mpv.exe")
+                .arg("--no-video")
+                .arg("--really-quiet")
+                .arg("--force-window=no")
+                .arg(target)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW_FLAG)
+                .spawn();
+            mpv_result.map_err(|mpv_error| {
+                io::Error::other(format!(
+                    "nie udało się uruchomić ffplay ({ffplay_error}) ani mpv ({mpv_error})"
+                ))
+            })
+        }
+    }
+}
+
+fn prepare_media_preview_source(
+    source: &MediaPreviewSource,
+    cancel_flag: Arc<AtomicBool>,
+) -> io::Result<PreparedMediaPreview> {
+    match source {
+        MediaPreviewSource::Local { path, .. } => Ok(PreparedMediaPreview::File {
+            path: path.clone(),
+            temp_path: None,
+        }),
+        MediaPreviewSource::Remote {
+            remote,
+            path,
+            stream_url,
+            ..
+        } => {
+            if let Some(url) = stream_url {
+                return Ok(PreparedMediaPreview::Url(url.clone()));
+            }
+            let local_path = download_remote_file_to_temp_for_preview(remote, path, cancel_flag)?;
+            Ok(PreparedMediaPreview::File {
+                path: local_path.clone(),
+                temp_path: Some(local_path),
+            })
+        }
+    }
+}
+
 impl AppState {
     fn new() -> io::Result<Self> {
         let settings = load_settings();
@@ -2384,6 +3319,7 @@ impl AppState {
             view_options: settings.view_options,
             discovery_cache: settings.discovery_cache.clone(),
             clipboard: None,
+            media_preview: None,
         })
     }
 
@@ -2403,6 +3339,7 @@ impl AppState {
 
     unsafe fn initialize_window(&mut self, hwnd: HWND) -> Result<(), String> {
         self.hwnd = hwnd;
+        self.media_preview = Some(MediaPreviewController::start(hwnd));
         self.create_menu();
         self.create_controls()?;
         self.refresh_all().map_err(|error| error.to_string())?;
@@ -2435,6 +3372,12 @@ impl AppState {
             MF_STRING,
             IDM_NEW_FOLDER as usize,
             wide("Nowy katalog\tF7").as_ptr(),
+        );
+        AppendMenuW(
+            file_menu,
+            MF_STRING,
+            IDM_MEDIA_PREVIEW as usize,
+            wide("Podgląd multimediów\tF3").as_ptr(),
         );
         AppendMenuW(
             file_menu,
@@ -2827,6 +3770,9 @@ impl AppState {
     fn announce_selection(&mut self) {
         let message = self.panels[self.active_panel].selection_announcement(self.view_options);
         self.notify(message);
+        unsafe {
+            self.update_media_preview_for_focus();
+        }
     }
 
     unsafe fn start_panel_load(&mut self, panel_index: usize, preferred_path: Option<PathBuf>) {
@@ -2843,6 +3789,7 @@ impl AppState {
             (panel.location.clone(), panel.load_generation)
         };
         self.rebuild_panel(panel_index);
+        self.update_media_preview_for_focus();
 
         let sender = self.panel_load_sender.clone();
         let view_options = self.view_options;
@@ -3302,6 +4249,7 @@ impl AppState {
     unsafe fn focus_panel(&mut self, panel_index: usize, announce: bool) {
         self.activate_panel(panel_index, announce);
         SetFocus(self.panels[panel_index].list_hwnd);
+        self.update_media_preview_for_focus();
     }
 
     unsafe fn handle_panel_action(&mut self, panel_index: usize, action: PanelAction) {
@@ -3338,6 +4286,7 @@ impl AppState {
             PanelAction::ExitSearch => self.exit_search_results(panel_index),
             PanelAction::MarkByExtension => self.mark_by_extension(panel_index),
             PanelAction::MarkByName => self.mark_by_name_pattern(panel_index),
+            PanelAction::MediaPreview => self.toggle_media_preview(panel_index),
         }
     }
 
@@ -3671,6 +4620,161 @@ impl AppState {
                 if let Err(error) = self.refresh_and_keep(panel_index, None) {
                     self.report_error(error);
                 }
+            }
+        }
+    }
+
+    unsafe fn toggle_media_preview(&mut self, panel_index: usize) {
+        if self
+            .media_preview
+            .as_ref()
+            .map(|preview| preview.enabled)
+            .unwrap_or(false)
+        {
+            if let Some(preview) = &mut self.media_preview {
+                preview.stop();
+            }
+            self.notify("zatrzymano podgląd multimediów");
+            return;
+        }
+
+        let Some(entry) = self.panels[panel_index].selected_entry().cloned() else {
+            self.notify("brak elementu do podglądu");
+            return;
+        };
+        let source = match self.media_preview_source(panel_index, &entry) {
+            Ok(source) => source,
+            Err(message) => {
+                self.notify(message);
+                return;
+            }
+        };
+        let name = source.name().to_string();
+        if let Some(preview) = &mut self.media_preview {
+            preview.play(source);
+            self.notify_non_interrupting(format!("uruchamiam podgląd multimediów {}", name));
+        } else {
+            self.notify("podgląd multimediów jest niedostępny");
+        }
+    }
+
+    fn focused_media_preview_source(&self) -> Option<MediaPreviewSource> {
+        let panel = &self.panels[self.active_panel];
+        let entry = panel.selected_entry()?;
+        self.media_preview_source(self.active_panel, entry).ok()
+    }
+
+    unsafe fn update_media_preview_for_focus(&mut self) {
+        if !self
+            .media_preview
+            .as_ref()
+            .map(|preview| preview.enabled)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let source = self.focused_media_preview_source();
+        let Some(preview) = &mut self.media_preview else {
+            return;
+        };
+        match source {
+            Some(source) => {
+                let signature = source.signature();
+                if preview.current_signature.as_deref() == Some(signature.as_str()) {
+                    return;
+                }
+                let name = source.name().to_string();
+                preview.play(source);
+                self.notify_non_interrupting(format!("podgląd multimediów {}", name));
+            }
+            None => {
+                if preview.active || preview.current_signature.is_some() {
+                    preview.stop_current();
+                    self.notify_non_interrupting("podgląd multimediów zatrzymany");
+                }
+            }
+        }
+    }
+
+    fn media_preview_source(
+        &self,
+        panel_index: usize,
+        entry: &PanelEntry,
+    ) -> Result<MediaPreviewSource, String> {
+        if entry.kind != EntryKind::File {
+            return Err("podgląd multimediów działa tylko na plikach".to_string());
+        }
+        let path = entry
+            .path
+            .clone()
+            .ok_or_else(|| "brak ścieżki pliku do podglądu".to_string())?;
+        let name = entry.name.clone();
+        match &self.panels[panel_index].location {
+            PanelLocation::Remote(remote) => {
+                if !is_media_extension(&path) {
+                    return Err("to nie jest rozpoznany plik audio ani video".to_string());
+                }
+                let stream_url = remote_media_preview_stream_target(&remote.resource, &path);
+                Ok(MediaPreviewSource::Remote {
+                    remote: remote.clone(),
+                    path,
+                    name,
+                    stream_url,
+                })
+            }
+            PanelLocation::Archive(_) => Err(
+                "podgląd multimediów z wnętrza archiwum nie jest jeszcze obsługiwany".to_string(),
+            ),
+            _ => {
+                let resolved = entry
+                    .link_target
+                    .as_ref()
+                    .filter(|target| target.is_file())
+                    .cloned()
+                    .unwrap_or(path);
+                if !is_media_extension(&resolved) {
+                    return Err("to nie jest rozpoznany plik audio ani video".to_string());
+                }
+                Ok(MediaPreviewSource::Local {
+                    path: resolved,
+                    name,
+                })
+            }
+        }
+    }
+
+    fn process_media_preview_messages(&mut self) {
+        let notifications = {
+            let Some(preview) = &mut self.media_preview else {
+                return;
+            };
+            let events = preview.drain_events();
+            let mut notifications = Vec::new();
+            for event in events {
+                match event {
+                    MediaPreviewEvent::Started { id, name } if preview.accepts_event(id) => {
+                        preview.active = true;
+                        notifications.push(Ok(format!("odtwarzam podgląd {}", name)));
+                    }
+                    MediaPreviewEvent::Finished { id } if preview.accepts_event(id) => {
+                        preview.mark_finished(id);
+                        notifications.push(Ok("podgląd multimediów zakończony".to_string()));
+                    }
+                    MediaPreviewEvent::Error { id, message } if preview.accepts_event(id) => {
+                        preview.mark_finished(id);
+                        notifications.push(Err(format!("podgląd multimediów: {message}")));
+                    }
+                    _ => {}
+                }
+            }
+            notifications
+        };
+
+        for notification in notifications {
+            match notification {
+                Ok(message) => self.notify_non_interrupting(message),
+                Err(message) => self.report_error(message),
             }
         }
     }
@@ -6424,8 +7528,12 @@ impl AppState {
     }
 
     unsafe fn show_permissions_for_selected(&mut self, panel_index: usize) {
-        if self.remote_location_for_panel(panel_index).is_some() {
-            self.notify("uprawnienia są dostępne tylko dla lokalnych elementów");
+        if let Some(remote) = self.remote_location_for_panel(panel_index) {
+            if remote.resource.protocol == NetworkProtocol::Sftp {
+                self.show_sftp_permissions_for_selected(panel_index, remote);
+            } else {
+                self.notify("zmiana uprawnień jest dostępna dla lokalnych elementów i SFTP");
+            }
             return;
         }
         match self.current_single_target(panel_index) {
@@ -6434,6 +7542,146 @@ impl AppState {
                 Err(error) => self.report_error(error),
             },
             Err(message) => self.notify(message),
+        }
+    }
+
+    unsafe fn show_sftp_permissions_for_selected(
+        &mut self,
+        panel_index: usize,
+        remote: RemoteLocation,
+    ) {
+        let targets = match self.current_targets(panel_index) {
+            Ok(targets) => targets,
+            Err(message) => {
+                self.notify(message);
+                return;
+            }
+        };
+
+        let change = match show_sftp_permissions_dialog(
+            self.hwnd,
+            vec![
+                "Ustaw tryb uprawnień cyframi albo polami wyboru.".to_string(),
+                "Właściciel i grupa są opcjonalne.".to_string(),
+                format!("Elementy: {}", summarize_targets(&targets)),
+            ],
+            Some(&self.nvda),
+        ) {
+            Some(change) => change,
+            None => {
+                self.notify("anulowano");
+                return;
+            }
+        };
+
+        let mut active_remote = remote;
+        loop {
+            let worker_remote = active_remote.clone();
+            let worker_targets = targets.clone();
+            let worker_change = change.clone();
+            let total = ItemCounts {
+                files: worker_targets.len(),
+                directories: 0,
+                bytes: 0,
+            };
+            let initial_lines = build_progress_lines(
+                "uprawnienia",
+                "Przygotowanie zmiany uprawnień.",
+                None,
+                None,
+                ItemCounts::default(),
+                total,
+                Duration::default(),
+            );
+            let outcome = match run_progress_dialog(
+                self.hwnd,
+                "Zmiana uprawnień SFTP",
+                initial_lines,
+                Some(&self.nvda),
+                ProgressDialogOptions {
+                    auto_close_on_success: true,
+                    auto_close_on_retryable_error: true,
+                },
+                move |progress_hwnd, sender, cancel_flag, conflict_receiver| {
+                    let mut progress = ProgressReporter::new(
+                        sender,
+                        progress_hwnd,
+                        cancel_flag,
+                        "uprawnienia",
+                        total,
+                        conflict_receiver,
+                    );
+                    for target in &worker_targets {
+                        if progress.is_canceled() {
+                            progress.finish(
+                                "Zmiana uprawnień anulowana.",
+                                "zmiana uprawnień anulowana".to_string(),
+                                WorkerOutcome::Canceled,
+                            );
+                            return;
+                        }
+                        progress.update("Zmieniam uprawnienia.", Some(target), None);
+                        match apply_sftp_permissions_to_target(
+                            &worker_remote,
+                            target,
+                            &worker_change,
+                        ) {
+                            Ok(()) => progress.add_counts(
+                                ItemCounts {
+                                    files: 1,
+                                    directories: 0,
+                                    bytes: 0,
+                                },
+                                "Zmieniono uprawnienia.",
+                                Some(target),
+                                None,
+                            ),
+                            Err(error) => {
+                                progress.finish(
+                                    &format!("Błąd: {error}"),
+                                    format!("zmiana uprawnień zakończona błędem: {error}"),
+                                    WorkerOutcome::Error(error.to_string()),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    progress.finish(
+                        "Zmiana uprawnień ukończona.",
+                        "zmiana uprawnień ukończona".to_string(),
+                        WorkerOutcome::Success,
+                    );
+                },
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.report_error(error);
+                    return;
+                }
+            };
+
+            match outcome {
+                WorkerOutcome::Success => {
+                    if let Err(error) = self.refresh_and_keep(panel_index, None) {
+                        self.report_error(error);
+                    } else {
+                        self.notify_non_interrupting("zmiana uprawnień ukończona".to_string());
+                    }
+                    return;
+                }
+                WorkerOutcome::Canceled => {
+                    self.notify("anulowano");
+                    return;
+                }
+                WorkerOutcome::Error(message) => {
+                    if let Some(candidate) = self.next_sftp_retry_remote(&active_remote, &message) {
+                        active_remote = candidate;
+                        continue;
+                    }
+                    self.report_error(message);
+                    return;
+                }
+            }
         }
     }
 
@@ -7163,6 +8411,7 @@ impl AppState {
                 match code {
                     x if x == LBN_SETFOCUS as u16 => {
                         self.activate_panel(panel_index, true);
+                        self.update_media_preview_for_focus();
                     }
                     x if x == LBN_SELCHANGE as u16 => {
                         self.sync_selection_from_control(panel_index);
@@ -7184,6 +8433,9 @@ impl AppState {
             IDM_COPY => self.handle_panel_action(self.active_panel, PanelAction::Copy),
             IDM_MOVE => self.handle_panel_action(self.active_panel, PanelAction::Move),
             IDM_NEW_FOLDER => self.handle_panel_action(self.active_panel, PanelAction::NewFolder),
+            IDM_MEDIA_PREVIEW => {
+                self.handle_panel_action(self.active_panel, PanelAction::MediaPreview)
+            }
             IDM_DELETE => self.handle_panel_action(self.active_panel, PanelAction::Delete),
             IDM_MARK_ALL => self.handle_panel_action(self.active_panel, PanelAction::MarkAll),
             IDM_UNMARK_ALL => self.handle_panel_action(self.active_panel, PanelAction::UnmarkAll),
@@ -7279,6 +8531,10 @@ impl AppState {
     }
 
     unsafe fn cleanup(&mut self) {
+        if let Some(preview) = &mut self.media_preview {
+            preview.shutdown();
+        }
+        self.media_preview = None;
         let _ = self.save_settings();
         if !self.font.is_null() {
             DeleteObject(self.font as _);
@@ -7336,6 +8592,10 @@ fn run() -> Result<(), String> {
         register_class(
             ARCHIVE_CREATE_DIALOG_CLASS,
             Some(archive_create_dialog_proc),
+        )?;
+        register_class(
+            SFTP_PERMISSIONS_DIALOG_CLASS,
+            Some(sftp_permissions_dialog_proc),
         )?;
 
         let app = Box::new(AppState::new().map_err(|error| error.to_string())?);
@@ -7480,6 +8740,12 @@ unsafe extern "system" fn main_window_proc(
             }
             0
         }
+        WM_MEDIA_PREVIEW_EVENT => {
+            if let Some(app) = app_state_mut(hwnd) {
+                app.process_media_preview_messages();
+            }
+            0
+        }
         WM_PANEL_SEARCH => {
             if let Some(app) = app_state_mut(hwnd) {
                 if let Some(ch) = char::from_u32(wparam as u32) {
@@ -7559,6 +8825,7 @@ unsafe extern "system" fn listbox_subclass_proc(
                 0x56 if ctrl_pressed() => Some(PanelAction::ClipboardPaste),
                 0x4D if ctrl_pressed() => Some(PanelAction::ContextMenu),
                 0x79 if shift_pressed() => Some(PanelAction::ContextMenu),
+                0x72 => Some(PanelAction::MediaPreview),
                 0x71 => Some(PanelAction::Rename),
                 0x74 => Some(PanelAction::Copy),
                 0x75 => Some(PanelAction::Move),
@@ -8416,6 +9683,7 @@ unsafe extern "system" fn network_dialog_proc(
             state.host_hwnd = host_hwnd;
             state.username_hwnd = username_hwnd;
             state.password_hwnd = password_hwnd;
+            state.ssh_key_label_hwnd = key_label;
             state.ssh_key_hwnd = ssh_key_hwnd;
             state.ssh_key_browse_hwnd = ssh_key_browse_hwnd;
             state.directory_hwnd = directory_hwnd;
@@ -8433,19 +9701,7 @@ unsafe extern "system" fn network_dialog_proc(
             let Some(state) = network_dialog_state_mut(hwnd) else {
                 return 0;
             };
-            let mut order = Vec::with_capacity(12);
-            order.push(state.info_hwnd);
-            order.push(state.protocol_hwnd);
-            order.push(state.host_hwnd);
-            order.push(state.username_hwnd);
-            order.push(state.password_hwnd);
-            order.push(state.anonymous_hwnd);
-            order.push(state.ssh_key_hwnd);
-            order.push(state.ssh_key_browse_hwnd);
-            order.push(state.directory_hwnd);
-            order.push(state.display_name_hwnd);
-            order.push(state.ok_hwnd);
-            order.push(state.cancel_hwnd);
+            let order = network_dialog_focus_order(state);
             focus_in_order(&order, lparam as HWND, wparam != 0);
             0
         }
@@ -8489,14 +9745,20 @@ unsafe extern "system" fn network_dialog_proc(
                             SetFocus(state.host_hwnd);
                             return 0;
                         }
+                        let protocol = selected_network_protocol(state);
+                        let ssh_key = if protocol == NetworkProtocol::Sftp {
+                            read_window_text(state.ssh_key_hwnd).trim().to_string()
+                        } else {
+                            String::new()
+                        };
                         let resource = NetworkResource {
-                            protocol: selected_network_protocol(state),
+                            protocol,
                             host: host.trim().to_string(),
                             username: read_window_text(state.username_hwnd).trim().to_string(),
                             password: read_window_text(state.password_hwnd),
                             root_password: state.initial.root_password.clone(),
                             sudo_password: state.initial.sudo_password.clone(),
-                            ssh_key: read_window_text(state.ssh_key_hwnd).trim().to_string(),
+                            ssh_key,
                             default_directory: read_window_text(state.directory_hwnd)
                                 .trim()
                                 .to_string(),
@@ -8533,6 +9795,318 @@ unsafe extern "system" fn network_dialog_proc(
         }
         WM_DESTROY => {
             if let Some(state) = network_dialog_state_mut(hwnd) {
+                state.done = true;
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe extern "system" fn sftp_permissions_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let create =
+                lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
+            let ptr = (*create).lpCreateParams as *mut SftpPermissionsDialogState;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+            1
+        }
+        WM_CREATE => {
+            let Some(state) = sftp_permissions_dialog_state_mut(hwnd) else {
+                return -1;
+            };
+            let font = GetStockObject(17) as HFONT;
+            let prompt_height = dialog_list_height(state.prompt_lines.len());
+            let info_hwnd = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                wide("LISTBOX").as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY as u32,
+                12,
+                12,
+                520,
+                prompt_height,
+                hwnd,
+                ID_DIALOG_INFO as HMENU,
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            SendMessageW(info_hwnd, 0x0030, font as WPARAM, 1);
+            populate_listbox_lines(info_hwnd, &state.prompt_lines);
+            SetWindowSubclass(
+                info_hwnd,
+                Some(dialog_listbox_subclass_proc),
+                91,
+                pack_dialog_button_ids(ID_DIALOG_OK, ID_DIALOG_CANCEL),
+            );
+
+            let mut row = 22 + prompt_height;
+            let label_width = 150;
+            let edit_left = 170;
+            let edit_width = 180;
+            let mode_label = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide(&make_access_label("Tryb cyfrowy chmod:")).as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                12,
+                row + 4,
+                label_width,
+                20,
+                hwnd,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            let mode_hwnd = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                wide("EDIT").as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER,
+                edit_left,
+                row,
+                edit_width,
+                24,
+                hwnd,
+                ID_PERM_MODE as HMENU,
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            row += 34;
+
+            let checkbox_specs = [
+                (ID_PERM_OWNER_READ, "Właściciel odczyt", 12, row),
+                (ID_PERM_OWNER_WRITE, "Właściciel zapis", 190, row),
+                (ID_PERM_OWNER_EXECUTE, "Właściciel wykonanie", 368, row),
+                (ID_PERM_GROUP_READ, "Grupa odczyt", 12, row + 28),
+                (ID_PERM_GROUP_WRITE, "Grupa zapis", 190, row + 28),
+                (ID_PERM_GROUP_EXECUTE, "Grupa wykonanie", 368, row + 28),
+                (ID_PERM_OTHER_READ, "Inni odczyt", 12, row + 56),
+                (ID_PERM_OTHER_WRITE, "Inni zapis", 190, row + 56),
+                (ID_PERM_OTHER_EXECUTE, "Inni wykonanie", 368, row + 56),
+            ];
+            let mut permission_hwnds = [null_mut(); 9];
+            for (index, (id, label, x, y)) in checkbox_specs.iter().enumerate() {
+                let control = CreateWindowExW(
+                    0,
+                    wide("BUTTON").as_ptr(),
+                    wide(label).as_ptr(),
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    *x,
+                    *y,
+                    165,
+                    24,
+                    hwnd,
+                    *id as HMENU,
+                    GetModuleHandleW(null()),
+                    null_mut(),
+                );
+                SendMessageW(control, 0x0030, font as WPARAM, 1);
+                SetWindowSubclass(control, Some(dialog_button_subclass_proc), 92 + index, 0);
+                permission_hwnds[index] = control;
+            }
+            row += 90;
+
+            let owner_label = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide(&make_access_label("Właściciel lub grupa:")).as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                12,
+                row + 4,
+                label_width,
+                20,
+                hwnd,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            let owner_hwnd = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                wide("EDIT").as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER,
+                edit_left,
+                row,
+                360,
+                24,
+                hwnd,
+                ID_PERM_OWNER as HMENU,
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            row += 34;
+
+            let recursive_hwnd = CreateWindowExW(
+                0,
+                wide("BUTTON").as_ptr(),
+                wide("Zastosuj rekurencyjnie dla katalogów i ich zawartości").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                edit_left,
+                row,
+                360,
+                24,
+                hwnd,
+                ID_PERM_RECURSIVE as HMENU,
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            row += 38;
+
+            let ok_hwnd = CreateWindowExW(
+                0,
+                wide("BUTTON").as_ptr(),
+                wide("Zastosuj").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+                338,
+                row,
+                94,
+                28,
+                hwnd,
+                ID_DIALOG_OK as HMENU,
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            let cancel_hwnd = CreateWindowExW(
+                0,
+                wide("BUTTON").as_ptr(),
+                wide("Anuluj").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
+                446,
+                row,
+                84,
+                28,
+                hwnd,
+                ID_DIALOG_CANCEL as HMENU,
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+
+            for control in [
+                mode_label,
+                mode_hwnd,
+                owner_label,
+                owner_hwnd,
+                recursive_hwnd,
+                ok_hwnd,
+                cancel_hwnd,
+            ] {
+                SendMessageW(control, 0x0030, font as WPARAM, 1);
+            }
+            SetWindowSubclass(mode_hwnd, Some(edit_subclass_proc), 101, 0);
+            SetWindowSubclass(owner_hwnd, Some(edit_subclass_proc), 102, 0);
+            SetWindowSubclass(recursive_hwnd, Some(dialog_button_subclass_proc), 103, 0);
+            SetWindowSubclass(ok_hwnd, Some(dialog_button_subclass_proc), 104, 0);
+            SetWindowSubclass(cancel_hwnd, Some(dialog_button_subclass_proc), 105, 0);
+
+            state.info_hwnd = info_hwnd;
+            state.mode_hwnd = mode_hwnd;
+            state.owner_hwnd = owner_hwnd;
+            state.recursive_hwnd = recursive_hwnd;
+            state.permission_hwnds = permission_hwnds;
+            state.ok_hwnd = ok_hwnd;
+            state.cancel_hwnd = cancel_hwnd;
+            SetFocus(info_hwnd);
+            speak_dialog_list_selection(state.owner, info_hwnd, &state.prompt_lines);
+            0
+        }
+        WM_DIALOG_NAVIGATE => {
+            let Some(state) = sftp_permissions_dialog_state_mut(hwnd) else {
+                return 0;
+            };
+            let order = sftp_permissions_dialog_focus_order(state);
+            focus_in_order(&order, lparam as HWND, wparam != 0);
+            0
+        }
+        WM_COMMAND => {
+            let id = loword(wparam as u32) as i32;
+            let code = hiword(wparam as u32);
+            if id == ID_DIALOG_INFO && code == LBN_SELCHANGE as u16 {
+                if let Some(state) = sftp_permissions_dialog_state_mut(hwnd) {
+                    speak_dialog_list_selection(state.owner, lparam as HWND, &state.prompt_lines);
+                    return 0;
+                }
+            }
+            if is_permission_checkbox_id(id) {
+                if let Some(state) = sftp_permissions_dialog_state_mut(hwnd) {
+                    let mode = permission_mode_from_dialog(state);
+                    SetWindowTextW(state.mode_hwnd, wide(&mode).as_ptr());
+                    if let Some(app) = app_state_mut(state.owner) {
+                        app.nvda.speak(&format!("tryb uprawnień {mode}"));
+                    }
+                    return 0;
+                }
+            }
+            match id {
+                ID_DIALOG_OK => {
+                    if let Some(state) = sftp_permissions_dialog_state_mut(hwnd) {
+                        let mode =
+                            match normalize_unix_mode_input(&read_window_text(state.mode_hwnd)) {
+                                Ok(mode) => mode,
+                                Err(message) => {
+                                    if let Some(app) = app_state_mut(state.owner) {
+                                        app.nvda.speak(&message);
+                                    }
+                                    SetFocus(state.mode_hwnd);
+                                    return 0;
+                                }
+                            };
+                        let owner =
+                            match normalize_unix_owner_input(&read_window_text(state.owner_hwnd)) {
+                                Ok(owner) => owner,
+                                Err(message) => {
+                                    if let Some(app) = app_state_mut(state.owner) {
+                                        app.nvda.speak(&message);
+                                    }
+                                    SetFocus(state.owner_hwnd);
+                                    return 0;
+                                }
+                            };
+                        if mode.is_none() && owner.is_none() {
+                            if let Some(app) = app_state_mut(state.owner) {
+                                app.nvda.speak("nie wybrano żadnej zmiany uprawnień");
+                            }
+                            SetFocus(state.mode_hwnd);
+                            return 0;
+                        }
+                        state.result = Some(SftpPermissionChange {
+                            mode,
+                            owner,
+                            recursive: is_button_checked(state.recursive_hwnd),
+                        });
+                        state.accepted = true;
+                    }
+                    DestroyWindow(hwnd);
+                    0
+                }
+                ID_DIALOG_CANCEL => {
+                    DestroyWindow(hwnd);
+                    0
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            let hdc = wparam as HDC;
+            SetTextColor(hdc, YELLOW);
+            SetBkColor(hdc, BLACK);
+            if msg == WM_CTLCOLORSTATIC {
+                SetBkMode(hdc, TRANSPARENT as i32);
+            }
+            GetStockObject(4) as LRESULT
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            if let Some(state) = sftp_permissions_dialog_state_mut(hwnd) {
                 state.done = true;
             }
             0
@@ -9487,8 +11061,106 @@ unsafe fn selected_network_protocol(state: &NetworkDialogState) -> NetworkProtoc
     }
 }
 
+unsafe fn network_dialog_focus_order(state: &NetworkDialogState) -> Vec<HWND> {
+    let mut order = Vec::with_capacity(12);
+    order.push(state.info_hwnd);
+    order.push(state.protocol_hwnd);
+    order.push(state.host_hwnd);
+    order.push(state.username_hwnd);
+    order.push(state.password_hwnd);
+    order.push(state.anonymous_hwnd);
+    if selected_network_protocol(state) == NetworkProtocol::Sftp {
+        order.push(state.ssh_key_hwnd);
+        order.push(state.ssh_key_browse_hwnd);
+    }
+    order.push(state.directory_hwnd);
+    order.push(state.display_name_hwnd);
+    order.push(state.ok_hwnd);
+    order.push(state.cancel_hwnd);
+    order
+}
+
 unsafe fn update_network_dialog_state(hwnd: HWND) {
-    let _ = hwnd;
+    let Some(state) = network_dialog_state_mut(hwnd) else {
+        return;
+    };
+    let show_ssh_key = selected_network_protocol(state) == NetworkProtocol::Sftp;
+    let visibility = if show_ssh_key { SW_SHOW } else { SW_HIDE };
+    for control in [
+        state.ssh_key_label_hwnd,
+        state.ssh_key_hwnd,
+        state.ssh_key_browse_hwnd,
+    ] {
+        if !control.is_null() {
+            ShowWindow(control, visibility);
+            EnableWindow(control, if show_ssh_key { 1 } else { 0 });
+        }
+    }
+    if !show_ssh_key {
+        let focused = GetFocus();
+        if focused == state.ssh_key_hwnd || focused == state.ssh_key_browse_hwnd {
+            SetFocus(state.directory_hwnd);
+        }
+    }
+}
+
+fn is_permission_checkbox_id(id: i32) -> bool {
+    matches!(
+        id,
+        ID_PERM_OWNER_READ
+            | ID_PERM_OWNER_WRITE
+            | ID_PERM_OWNER_EXECUTE
+            | ID_PERM_GROUP_READ
+            | ID_PERM_GROUP_WRITE
+            | ID_PERM_GROUP_EXECUTE
+            | ID_PERM_OTHER_READ
+            | ID_PERM_OTHER_WRITE
+            | ID_PERM_OTHER_EXECUTE
+    )
+}
+
+unsafe fn sftp_permissions_dialog_focus_order(state: &SftpPermissionsDialogState) -> Vec<HWND> {
+    let mut order = Vec::with_capacity(15);
+    order.push(state.info_hwnd);
+    order.push(state.mode_hwnd);
+    order.extend(state.permission_hwnds.iter().copied());
+    order.push(state.owner_hwnd);
+    order.push(state.recursive_hwnd);
+    order.push(state.ok_hwnd);
+    order.push(state.cancel_hwnd);
+    order
+}
+
+unsafe fn permission_mode_from_dialog(state: &SftpPermissionsDialogState) -> String {
+    let digit = |read: HWND, write: HWND, execute: HWND| -> u8 {
+        let mut value = 0u8;
+        if is_button_checked(read) {
+            value += 4;
+        }
+        if is_button_checked(write) {
+            value += 2;
+        }
+        if is_button_checked(execute) {
+            value += 1;
+        }
+        value
+    };
+    let owner = digit(
+        state.permission_hwnds[0],
+        state.permission_hwnds[1],
+        state.permission_hwnds[2],
+    );
+    let group = digit(
+        state.permission_hwnds[3],
+        state.permission_hwnds[4],
+        state.permission_hwnds[5],
+    );
+    let other = digit(
+        state.permission_hwnds[6],
+        state.permission_hwnds[7],
+        state.permission_hwnds[8],
+    );
+    format!("0{owner}{group}{other}")
 }
 
 unsafe extern "system" fn progress_dialog_proc(
@@ -10147,6 +11819,7 @@ unsafe fn show_network_connection_dialog(
         host_hwnd: null_mut(),
         username_hwnd: null_mut(),
         password_hwnd: null_mut(),
+        ssh_key_label_hwnd: null_mut(),
         ssh_key_hwnd: null_mut(),
         ssh_key_browse_hwnd: null_mut(),
         directory_hwnd: null_mut(),
@@ -10186,21 +11859,127 @@ unsafe fn show_network_connection_dialog(
         if message.message == WM_KEYDOWN {
             let focused = GetFocus();
             if message.wParam as u32 == 0x09 {
-                let mut order = Vec::with_capacity(12);
-                order.push(state.info_hwnd);
-                order.push(state.protocol_hwnd);
-                order.push(state.host_hwnd);
-                order.push(state.username_hwnd);
-                order.push(state.password_hwnd);
-                order.push(state.anonymous_hwnd);
-                order.push(state.ssh_key_hwnd);
-                order.push(state.ssh_key_browse_hwnd);
-                order.push(state.directory_hwnd);
-                order.push(state.display_name_hwnd);
-                order.push(state.ok_hwnd);
-                order.push(state.cancel_hwnd);
+                let order = network_dialog_focus_order(&state);
                 focus_in_order(&order, focused, shift_pressed());
                 continue;
+            }
+            if message.wParam as u32 == 0x1B {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    ID_DIALOG_CANCEL as WPARAM,
+                    state.cancel_hwnd as LPARAM,
+                );
+                continue;
+            }
+        }
+        if IsDialogMessageW(hwnd, &mut message) == 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    EnableWindow(owner, 1);
+    if let Some(app) = app_state_mut(owner) {
+        SetFocus(app.panels[app.active_panel].list_hwnd);
+    } else {
+        SetFocus(owner);
+    }
+    if state.accepted {
+        state.result.take()
+    } else {
+        None
+    }
+}
+
+unsafe fn show_sftp_permissions_dialog(
+    owner: HWND,
+    prompt_lines: Vec<String>,
+    nvda: Option<&NvdaController>,
+) -> Option<SftpPermissionChange> {
+    let mut state = Box::new(SftpPermissionsDialogState {
+        owner,
+        result: None,
+        done: false,
+        accepted: false,
+        prompt_lines,
+        info_hwnd: null_mut(),
+        mode_hwnd: null_mut(),
+        owner_hwnd: null_mut(),
+        recursive_hwnd: null_mut(),
+        permission_hwnds: [null_mut(); 9],
+        ok_hwnd: null_mut(),
+        cancel_hwnd: null_mut(),
+    });
+
+    let ptr = &mut *state as *mut SftpPermissionsDialogState;
+    EnableWindow(owner, 0);
+    if let Some(nvda) = nvda {
+        nvda.speak_non_interrupting("Uprawnienia SFTP");
+    }
+    let hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+        wide(SFTP_PERMISSIONS_DIALOG_CLASS).as_ptr(),
+        wide("Uprawnienia SFTP").as_ptr(),
+        WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        560,
+        430,
+        owner,
+        null_mut(),
+        GetModuleHandleW(null()),
+        ptr as _,
+    );
+
+    if hwnd.is_null() {
+        EnableWindow(owner, 1);
+        return None;
+    }
+
+    let mut message: MSG = std::mem::zeroed();
+    while !state.done && GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+        if message.message == WM_KEYDOWN {
+            let focused = GetFocus();
+            if message.wParam as u32 == 0x09 {
+                let order = sftp_permissions_dialog_focus_order(&state);
+                focus_in_order(&order, focused, shift_pressed());
+                continue;
+            }
+            if message.wParam as u32 == 0x0D {
+                if state.permission_hwnds.contains(&focused) || focused == state.recursive_hwnd {
+                    let checked = !is_button_checked(focused);
+                    set_radio_checked(focused, checked);
+                    if state.permission_hwnds.contains(&focused) {
+                        let mode = permission_mode_from_dialog(&state);
+                        SetWindowTextW(state.mode_hwnd, wide(&mode).as_ptr());
+                        if let Some(app) = app_state_mut(state.owner) {
+                            app.nvda.speak(&format!("tryb uprawnień {mode}"));
+                        }
+                    }
+                    continue;
+                }
+                if focused == state.mode_hwnd
+                    || focused == state.owner_hwnd
+                    || focused == state.ok_hwnd
+                {
+                    SendMessageW(
+                        hwnd,
+                        WM_COMMAND,
+                        ID_DIALOG_OK as WPARAM,
+                        state.ok_hwnd as LPARAM,
+                    );
+                    continue;
+                }
+                if focused == state.cancel_hwnd {
+                    SendMessageW(
+                        hwnd,
+                        WM_COMMAND,
+                        ID_DIALOG_CANCEL as WPARAM,
+                        state.cancel_hwnd as LPARAM,
+                    );
+                    continue;
+                }
             }
             if message.wParam as u32 == 0x1B {
                 SendMessageW(
@@ -10984,6 +12763,12 @@ unsafe fn create_context_popup_menu() -> HMENU {
         MF_STRING,
         IDM_NEW_FOLDER as usize,
         wide("Nowy katalog\tF7").as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        IDM_MEDIA_PREVIEW as usize,
+        wide("Podgląd multimediów\tF3").as_ptr(),
     );
     AppendMenuW(
         menu,
@@ -12150,12 +13935,51 @@ fn build_network_uri(
     }
 }
 
+fn build_http_network_uri(scheme: &str, host: &str, directory: &str) -> String {
+    let mut clean_host = host
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string();
+    if clean_host.is_empty() {
+        clean_host = host.trim().to_string();
+    }
+    if directory.is_empty() {
+        format!("{scheme}://{clean_host}")
+    } else {
+        format!("{scheme}://{clean_host}/{directory}")
+    }
+}
+
+fn normalize_http_base_url(resource: &NetworkResource) -> io::Result<Url> {
+    let host = resource.normalized_host();
+    if host.is_empty() {
+        return Err(io::Error::other("brak hosta połączenia"));
+    }
+    let scheme = match resource.protocol {
+        NetworkProtocol::Https => "https",
+        _ => "http",
+    };
+    let raw = if host.starts_with("http://") || host.starts_with("https://") {
+        host
+    } else {
+        format!("{scheme}://{host}")
+    };
+    let mut url = Url::parse(&raw).map_err(|error| io::Error::other(error.to_string()))?;
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    Ok(url)
+}
+
 fn encode_uri_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let mut encoded = String::with_capacity(normalized.len());
     for byte in normalized.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
                 encoded.push(byte as char)
             }
             _ => {
@@ -12167,10 +13991,337 @@ fn encode_uri_path(path: &str) -> String {
     encoded
 }
 
+fn parse_http_directory_listing(
+    body: &str,
+    current_url: &Url,
+    base_url: &Url,
+) -> io::Result<Vec<RemoteFile>> {
+    let href_regex =
+        Regex::new(r#"(?is)<a\s+[^>]*href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>(.*?)</a>"#)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for capture in href_regex.captures_iter(body) {
+        let raw_href = [1, 2, 3]
+            .iter()
+            .filter_map(|index| capture.get(*index))
+            .map(|item| item.as_str())
+            .next()
+            .unwrap_or_default();
+        let raw_href = html_unescape_basic(raw_href);
+        let href = raw_href.trim();
+        if href.is_empty()
+            || href.starts_with('#')
+            || href.starts_with('?')
+            || href.eq_ignore_ascii_case("../")
+            || href.eq_ignore_ascii_case("..")
+            || href.to_lowercase().starts_with("mailto:")
+            || href.to_lowercase().starts_with("javascript:")
+        {
+            continue;
+        }
+
+        let link_text = strip_html_tags(capture.get(4).map(|item| item.as_str()).unwrap_or(""));
+        let link_text = html_unescape_basic(link_text.trim());
+        if link_text.eq_ignore_ascii_case("parent directory") || link_text == ".." {
+            continue;
+        }
+
+        let href_for_join = normalize_http_href_for_join(href);
+        let resolved = match current_url.join(&href_for_join) {
+            Ok(url) => url,
+            Err(_) => continue,
+        };
+        if resolved.scheme() != base_url.scheme()
+            || resolved.host_str() != base_url.host_str()
+            || resolved.port_or_known_default() != base_url.port_or_known_default()
+        {
+            continue;
+        }
+        if resolved.path() == current_url.path() {
+            continue;
+        }
+        let Some(path) = http_logical_path_from_url(base_url, &resolved) else {
+            continue;
+        };
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+
+        let is_dir = href.trim_end_matches('?').ends_with('/') || resolved.path().ends_with('/');
+        let mut metadata = RemoteMetadata::default().file_type(if is_dir {
+            RemoteFileType::Directory
+        } else {
+            RemoteFileType::File
+        });
+        if !is_dir {
+            if let Some(size) = capture
+                .get(0)
+                .and_then(|anchor| parse_http_listing_size(&body[anchor.end()..]))
+            {
+                metadata = metadata.size(size);
+            }
+        }
+        entries.push(RemoteFile { path, metadata });
+    }
+
+    Ok(entries)
+}
+
+fn normalize_http_href_for_join(href: &str) -> String {
+    let mut output = String::with_capacity(href.len());
+    for ch in href.chars() {
+        match ch {
+            ' ' => output.push_str("%20"),
+            '\t' => output.push_str("%09"),
+            '\r' => output.push_str("%0D"),
+            '\n' => output.push_str("%0A"),
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+fn parse_http_listing_size(after_anchor: &str) -> Option<u64> {
+    if let Some(size) = parse_http_table_cell_size(after_anchor) {
+        return Some(size);
+    }
+
+    let lower = after_anchor.to_lowercase();
+    let mut end = after_anchor.len().min(512);
+    for marker in ["\r", "\n", "<br", "</tr", "<tr", "<a "] {
+        if let Some(index) = lower.find(marker) {
+            end = end.min(index);
+        }
+    }
+
+    let fragment = &after_anchor[..end];
+    let text = html_unescape_basic(&strip_html_tags_to_spaces(fragment)).replace('\u{a0}', " ");
+    parse_http_size_text(&text)
+}
+
+fn parse_http_table_cell_size(after_anchor: &str) -> Option<u64> {
+    let lower = after_anchor.to_lowercase();
+    let td_start = lower.find("<td")?;
+    let after_td = &after_anchor[td_start..];
+    let cell_start = after_td.find('>')? + 1;
+    let cell_contents = &after_td[cell_start..];
+    let lower_contents = cell_contents.to_lowercase();
+    let mut end = cell_contents.len().min(256);
+    for marker in ["</td", "<td", "</tr", "<tr", "\r", "\n"] {
+        if let Some(index) = lower_contents.find(marker) {
+            end = end.min(index);
+        }
+    }
+
+    let text = html_unescape_basic(&strip_html_tags_to_spaces(&cell_contents[..end]))
+        .replace('\u{a0}', " ");
+    if text.to_lowercase().contains("folder") {
+        return None;
+    }
+    parse_http_size_text(&text)
+}
+
+fn parse_http_size_text(text: &str) -> Option<u64> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let last = tokens
+        .last()?
+        .trim_matches(|ch: char| ch == ',' || ch == ';');
+    if last == "-" {
+        return None;
+    }
+
+    if is_http_size_unit(last) {
+        let value = tokens
+            .get(tokens.len().saturating_sub(2))?
+            .trim_matches(|ch: char| ch == ',' || ch == ';');
+        return parse_http_size_token(&format!("{value}{last}"));
+    }
+
+    parse_http_size_token(last)
+}
+
+fn parse_http_size_token(token: &str) -> Option<u64> {
+    let token = token
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']' | ',' | ';'));
+    if token.is_empty() || token == "-" || token.contains(':') || token.contains('-') {
+        return None;
+    }
+
+    let upper = token.to_ascii_uppercase();
+    let suffixes = [
+        ("PIB", 1024_u64.pow(5)),
+        ("PB", 1024_u64.pow(5)),
+        ("P", 1024_u64.pow(5)),
+        ("TIB", 1024_u64.pow(4)),
+        ("TB", 1024_u64.pow(4)),
+        ("T", 1024_u64.pow(4)),
+        ("GIB", 1024_u64.pow(3)),
+        ("GB", 1024_u64.pow(3)),
+        ("G", 1024_u64.pow(3)),
+        ("MIB", 1024_u64.pow(2)),
+        ("MB", 1024_u64.pow(2)),
+        ("M", 1024_u64.pow(2)),
+        ("KIB", 1024),
+        ("KB", 1024),
+        ("K", 1024),
+        ("B", 1),
+    ];
+
+    for (suffix, multiplier) in suffixes {
+        if let Some(number) = upper.strip_suffix(suffix) {
+            let value = number.trim().replace(',', ".").parse::<f64>().ok()?;
+            return Some((value * multiplier as f64).round() as u64);
+        }
+    }
+
+    let digits = upper.replace(',', "");
+    if digits.chars().all(|ch| ch.is_ascii_digit()) {
+        let value = digits.parse::<u64>().ok()?;
+        if (1900..=2100).contains(&value) && digits.len() == 4 {
+            return None;
+        }
+        return Some(value);
+    }
+
+    None
+}
+
+fn is_http_size_unit(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        "B" | "K"
+            | "KB"
+            | "KIB"
+            | "M"
+            | "MB"
+            | "MIB"
+            | "G"
+            | "GB"
+            | "GIB"
+            | "T"
+            | "TB"
+            | "TIB"
+            | "P"
+            | "PB"
+            | "PIB"
+    )
+}
+
+fn http_logical_path_from_url(base_url: &Url, url: &Url) -> Option<PathBuf> {
+    let base_path = if base_url.path().ends_with('/') {
+        base_url.path().to_string()
+    } else {
+        format!("{}/", base_url.path())
+    };
+    let target_path = url.path();
+    if !target_path.starts_with(&base_path) {
+        return None;
+    }
+    let relative = target_path[base_path.len()..].trim_matches('/');
+    if relative.is_empty() {
+        return None;
+    }
+    let decoded = percent_decode_lossy(relative);
+    Some(Path::new("/").join(decoded))
+}
+
+fn percent_decode_lossy(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                output.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).to_string()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn html_unescape_basic(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn strip_html_tags(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn strip_html_tags_to_spaces(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                if !output
+                    .chars()
+                    .last()
+                    .map(|ch| ch.is_whitespace())
+                    .unwrap_or(true)
+                {
+                    output.push(' ');
+                }
+            }
+            '>' => {
+                in_tag = false;
+                if !output
+                    .chars()
+                    .last()
+                    .map(|ch| ch.is_whitespace())
+                    .unwrap_or(true)
+                {
+                    output.push(' ');
+                }
+            }
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+}
+
 fn is_media_extension(path: &Path) -> bool {
     const MEDIA_EXTENSIONS: &[&str] = &[
-        "mp3", "wav", "flac", "ogg", "m4a", "aac", "wma", "opus", "mp4", "m4v", "mkv", "avi",
-        "mov", "wmv", "webm", "mpeg", "mpg", "ts", "m2ts", "flv",
+        "3g2", "3gp", "aac", "ac3", "aif", "aifc", "aiff", "alac", "amr", "ape", "asf", "au",
+        "avi", "caf", "dff", "dsf", "dts", "dv", "f4v", "flac", "flv", "it", "m2ts", "m4a", "m4b",
+        "m4p", "m4v", "mid", "midi", "mka", "mkv", "mod", "mov", "mp1", "mp2", "mp3", "mp4", "mpa",
+        "mpc", "mpeg", "mpg", "mts", "mxf", "oga", "ogg", "ogm", "ogv", "opus", "ra", "ram", "rm",
+        "s3m", "spx", "tak", "ts", "tta", "umx", "vob", "wav", "webm", "wma", "wmv", "wv", "xm",
     ];
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -12237,6 +14388,42 @@ fn remote_media_stream_target(resource: &NetworkResource, path: &Path) -> Option
     }
 }
 
+fn can_preview_stream_remote_media(resource: &NetworkResource) -> bool {
+    if !resource.anonymous
+        && (!resource.username.trim().is_empty() || !resource.password.is_empty())
+    {
+        return false;
+    }
+    matches!(
+        resource.protocol,
+        NetworkProtocol::Http
+            | NetworkProtocol::Https
+            | NetworkProtocol::Ftp
+            | NetworkProtocol::Ftps
+            | NetworkProtocol::WebDav
+    )
+}
+
+fn remote_media_preview_stream_target(resource: &NetworkResource, path: &Path) -> Option<String> {
+    if !is_media_extension(path) || !can_preview_stream_remote_media(resource) {
+        return None;
+    }
+
+    match resource.protocol {
+        NetworkProtocol::Http | NetworkProtocol::Https => {
+            let session = HttpSession::new(resource.clone()).ok()?;
+            session
+                .url_for_path(path, false)
+                .ok()
+                .map(|url| url.to_string())
+        }
+        NetworkProtocol::Ftp | NetworkProtocol::Ftps | NetworkProtocol::WebDav => {
+            remote_media_stream_target(resource, path)
+        }
+        _ => None,
+    }
+}
+
 fn read_drive_entries() -> Vec<PanelEntry> {
     let mut entries = vec![
         PanelEntry::favorite_directories_root(),
@@ -12297,9 +14484,65 @@ fn remote_error_to_io(error: remotefs::RemoteError) -> io::Error {
     }
 }
 
+fn reqwest_error_to_io(error: reqwest::Error) -> io::Error {
+    if error.is_timeout() {
+        io::Error::new(io::ErrorKind::TimedOut, error.to_string())
+    } else if error.is_connect() {
+        io::Error::new(io::ErrorKind::ConnectionRefused, error.to_string())
+    } else {
+        io::Error::other(error.to_string())
+    }
+}
+
+fn ensure_http_success(response: HttpResponse) -> io::Result<HttpResponse> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let url = response.url().to_string();
+    let kind = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => io::ErrorKind::PermissionDenied,
+        StatusCode::NOT_FOUND => io::ErrorKind::NotFound,
+        StatusCode::METHOD_NOT_ALLOWED => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::Other,
+    };
+    let message = match status {
+        StatusCode::FORBIDDEN => format!(
+            "Serwer odmówił dostępu do elementu HTTP/HTTPS. Kod odpowiedzi: 403 Forbidden. Element może być widoczny w listingu, ale serwer nie pozwala go pobrać: {url}"
+        ),
+        StatusCode::UNAUTHORIZED => format!(
+            "Serwer wymaga uwierzytelnienia HTTP/HTTPS. Kod odpowiedzi: 401 Unauthorized: {url}"
+        ),
+        StatusCode::NOT_FOUND => {
+            format!("Nie znaleziono elementu HTTP/HTTPS. Kod odpowiedzi: 404 Not Found: {url}")
+        }
+        StatusCode::METHOD_NOT_ALLOWED => format!(
+            "Serwer HTTP/HTTPS nie obsługuje tej metody dla elementu. Kod odpowiedzi: 405 Method Not Allowed: {url}"
+        ),
+        _ => format!(
+            "HTTP {} {}: {url}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
+        ),
+    };
+    Err(io::Error::new(kind, message))
+}
+
+fn http_read_only_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "zasób HTTP/HTTPS jest tylko do odczytu",
+    )
+}
+
 fn is_permission_denied_message(message: &str) -> bool {
     let lowered = message.to_lowercase();
     lowered.contains("permission denied")
+        || lowered.contains("operation not permitted")
+        || lowered.contains("operation not allowed")
+        || lowered.contains("not permitted")
+        || lowered.contains("operacja nie dozwolona")
+        || lowered.contains("operacja niedozwolona")
         || lowered.contains("access denied")
         || lowered.contains("odmowa dostępu")
 }
@@ -12394,6 +14637,86 @@ fn remote_child_path(base: &Path, name: &str) -> PathBuf {
     } else {
         PathBuf::from(format!("{}/{}", base.trim_end_matches('/'), name))
     }
+}
+
+fn normalize_unix_mode_input(input: &str) -> Result<Option<String>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !(3..=4).contains(&trimmed.len()) || !trimmed.chars().all(|ch| matches!(ch, '0'..='7')) {
+        return Err(
+            "tryb uprawnień musi być liczbą ósemkową, na przykład 644, 0644 albo 0755".to_string(),
+        );
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn normalize_unix_owner_input(input: &str) -> Result<Option<String>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed == ":" {
+        return Err("właściciel lub grupa nie mogą być puste jednocześnie".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("właściciel i grupa nie mogą zawierać spacji".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err("właściciel nie może zaczynać się od minusa".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn apply_sftp_permissions_to_target(
+    remote: &RemoteLocation,
+    target: &Path,
+    change: &SftpPermissionChange,
+) -> io::Result<()> {
+    if remote.resource.protocol != NetworkProtocol::Sftp {
+        return Err(io::Error::other(
+            "zmiana uprawnień jest dostępna tylko dla SFTP",
+        ));
+    }
+
+    let recursive = if change.recursive { " -R" } else { "" };
+    let target = shell_quote_posix(&remote_shell_path(target));
+    if let Some(mode) = &change.mode {
+        run_sftp_permission_command(remote, &format!("chmod{recursive} -- {mode} {target}"))?;
+    }
+    if let Some(owner) = &change.owner {
+        run_sftp_permission_command(
+            remote,
+            &format!("chown{recursive} -- {} {target}", shell_quote_posix(owner)),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_sftp_permission_command(remote: &RemoteLocation, cmd: &str) -> io::Result<()> {
+    if remote.uses_sftp_sudo() {
+        exec_sftp_sudo_command(&remote.resource, cmd)?;
+        return Ok(());
+    }
+
+    let (code, output) = exec_remote_command(&remote.resource, &format!("{cmd} 2>&1"))?;
+    if code == 0 {
+        return Ok(());
+    }
+
+    let message = output.trim();
+    let message = if message.is_empty() {
+        format!("polecenie SFTP nie powiodło się z kodem {code}: {cmd}")
+    } else {
+        message.to_string()
+    };
+    let kind = if is_sftp_retry_message(&message) {
+        io::ErrorKind::PermissionDenied
+    } else {
+        io::ErrorKind::Other
+    };
+    Err(io::Error::new(kind, message))
 }
 
 fn is_sftp_sudo_location(remote: &RemoteLocation) -> bool {
@@ -13247,6 +15570,11 @@ fn connect_remote_client(resource: &NetworkResource) -> io::Result<RemoteClient>
                 resource.password.as_str()
             };
             let mut client = RemoteClient::WebDav(WebDAVFs::new(username, password, &base_url));
+            client.connect()?;
+            Ok(client)
+        }
+        NetworkProtocol::Http | NetworkProtocol::Https => {
+            let mut client = RemoteClient::Http(HttpSession::new(resource.clone())?);
             client.connect()?;
             Ok(client)
         }
@@ -14505,6 +16833,109 @@ fn download_remote_file_to_temp_with_progress(
             let _ = fs::remove_file(&local_path);
             Err(io::Error::new(io::ErrorKind::Interrupted, "anulowano"))
         }
+        Err(error) => {
+            let _ = fs::remove_file(&local_path);
+            Err(error)
+        }
+    }
+}
+
+fn download_remote_file_to_temp_for_preview(
+    remote: &RemoteLocation,
+    path: &Path,
+    cancel_flag: Arc<AtomicBool>,
+) -> io::Result<PathBuf> {
+    if remote.uses_sftp_sudo() {
+        return download_sftp_file_via_sudo_to_temp_for_preview(remote, path, cancel_flag);
+    }
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "anulowano"));
+    }
+    let mut client = connect_remote_client(&remote.resource)?;
+    let file_name = path
+        .file_name()
+        .map(|item| item.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "remote-media.bin".to_string());
+    let local_path = unique_temp_file_path(
+        "AmigaFmPreview",
+        &format!("{}_{}", remote.resource.effective_display_name(), file_name),
+    )?;
+    let writer = CancelableFileWriter::new(fs::File::create(&local_path)?, cancel_flag.clone());
+    let result = client.download_to(path, Box::new(writer));
+    client.disconnect();
+    match result {
+        Ok(_) if cancel_flag.load(Ordering::Relaxed) => {
+            let _ = fs::remove_file(&local_path);
+            Err(io::Error::new(io::ErrorKind::Interrupted, "anulowano"))
+        }
+        Ok(_) => Ok(local_path),
+        Err(error) => {
+            let _ = fs::remove_file(&local_path);
+            Err(error)
+        }
+    }
+}
+
+fn download_sftp_file_via_sudo_to_temp_for_preview(
+    remote: &RemoteLocation,
+    path: &Path,
+    cancel_flag: Arc<AtomicBool>,
+) -> io::Result<PathBuf> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "anulowano"));
+    }
+    let file_name = path
+        .file_name()
+        .map(|item| item.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "remote-media.bin".to_string());
+    let local_path = unique_temp_file_path(
+        "AmigaFmPreview",
+        &format!("{}_{}", remote.resource.effective_display_name(), file_name),
+    )?;
+
+    let remote_temp = exec_remote_command(&remote.resource, "mktemp")
+        .map(|(_, output)| output.trim().to_string())
+        .and_then(|output| {
+            if output.is_empty() {
+                Err(io::Error::other(
+                    "nie udało się przygotować pliku tymczasowego na serwerze",
+                ))
+            } else {
+                Ok(PathBuf::from(output))
+            }
+        })?;
+
+    let source = shell_quote_posix(&remote_shell_path(path));
+    let temp = shell_quote_posix(&remote_shell_path(&remote_temp));
+    exec_sftp_sudo_command(
+        &remote.resource,
+        &format!("cp -- {source} {temp} && chmod 0644 {temp}"),
+    )?;
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        let _ = exec_remote_command(
+            &remote.resource,
+            &format!(
+                "rm -f -- {}",
+                shell_quote_posix(&remote_shell_path(&remote_temp))
+            ),
+        );
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "anulowano"));
+    }
+
+    let mut client = connect_remote_client(&remote.resource)?;
+    let writer = CancelableFileWriter::new(fs::File::create(&local_path)?, cancel_flag.clone());
+    let result = client.download_to(&remote_temp, Box::new(writer));
+    let _ = client.remove_file(&remote_temp);
+    client.disconnect();
+    match result {
+        Ok(_) if cancel_flag.load(Ordering::Relaxed) => {
+            let _ = fs::remove_file(&local_path);
+            Err(io::Error::new(io::ErrorKind::Interrupted, "anulowano"))
+        }
+        Ok(_) => Ok(local_path),
         Err(error) => {
             let _ = fs::remove_file(&local_path);
             Err(error)
@@ -17321,6 +19752,13 @@ unsafe fn discovery_dialog_state_mut(hwnd: HWND) -> Option<&'static mut Discover
     ptr.as_mut()
 }
 
+unsafe fn sftp_permissions_dialog_state_mut(
+    hwnd: HWND,
+) -> Option<&'static mut SftpPermissionsDialogState> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SftpPermissionsDialogState;
+    ptr.as_mut()
+}
+
 unsafe fn archive_create_dialog_state_mut(
     hwnd: HWND,
 ) -> Option<&'static mut ArchiveCreateDialogState> {
@@ -17612,4 +20050,114 @@ fn summarize_targets(targets: &[PathBuf]) -> String {
 
 fn last_error_message(prefix: &str) -> String {
     format!("{prefix}: {}", io::Error::last_os_error())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_listing_keeps_spaces_and_reads_size() {
+        let body = r#"<html><body><pre><a href="cos tam.mp3">cos tam.mp3</a> 30-Apr-2026 16:02      3M</pre></body></html>"#;
+        let current_url = Url::parse("https://example.com/pliki/").unwrap();
+        let entries = parse_http_directory_listing(body, &current_url, &current_url).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/cos tam.mp3"));
+        assert_eq!(entries[0].metadata.size, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn http_listing_decodes_percent_encoded_names() {
+        let body = r#"<pre><a href="Mr%20Gracz%20-%20test.mp3">Mr Gracz - test.mp3</a> 30-Apr-2026 16:02      12K</pre>"#;
+        let current_url = Url::parse("https://example.com/pliki/").unwrap();
+        let entries = parse_http_directory_listing(body, &current_url, &current_url).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/Mr Gracz - test.mp3"));
+        assert_eq!(entries[0].metadata.size, 12 * 1024);
+    }
+
+    #[test]
+    fn http_table_listing_reads_decimal_comma_size() {
+        let body = r#"<table><tr><td> <a href="nvda.exe"><img src="/~img44" /> nvda.exe</a><td align=right>20,23 MB<td align=right>2023-11-03 20:34:08<td align=right>0</table>"#;
+        let current_url = Url::parse("http://superfon.myftp.org:9080/").unwrap();
+        let entries = parse_http_directory_listing(body, &current_url, &current_url).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/nvda.exe"));
+        assert_eq!(entries[0].metadata.size, 21_212_692);
+    }
+
+    #[test]
+    fn http_path_encoding_uses_percent_twenty_for_spaces() {
+        assert_eq!(
+            encode_uri_path("katalog/cos tam.mp3"),
+            "katalog/cos%20tam.mp3"
+        );
+    }
+
+    #[test]
+    fn http_session_builds_encoded_file_url() {
+        let resource = NetworkResource {
+            protocol: NetworkProtocol::Https,
+            host: "example.com/pliki".to_string(),
+            anonymous: true,
+            ..Default::default()
+        };
+        let session = HttpSession::new(resource).unwrap();
+        let url = session
+            .url_for_path(Path::new("/cos tam.mp3"), false)
+            .unwrap();
+
+        assert_eq!(url.as_str(), "https://example.com/pliki/cos%20tam.mp3");
+    }
+
+    #[test]
+    fn http_media_is_downloaded_instead_of_opened_as_system_stream() {
+        let resource = NetworkResource {
+            protocol: NetworkProtocol::Https,
+            host: "example.com/pliki".to_string(),
+            anonymous: true,
+            ..Default::default()
+        };
+
+        assert!(remote_media_stream_target(&resource, Path::new("/cos tam.mp3")).is_none());
+    }
+
+    #[test]
+    fn http_media_preview_streams_with_encoded_url() {
+        let resource = NetworkResource {
+            protocol: NetworkProtocol::Https,
+            host: "example.com/pliki".to_string(),
+            anonymous: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            remote_media_preview_stream_target(&resource, Path::new("/cos tam.mp3")).as_deref(),
+            Some("https://example.com/pliki/cos%20tam.mp3")
+        );
+    }
+
+    #[test]
+    fn private_http_media_preview_falls_back_to_download() {
+        let resource = NetworkResource {
+            protocol: NetworkProtocol::Https,
+            host: "example.com/pliki".to_string(),
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            anonymous: false,
+            ..Default::default()
+        };
+
+        assert!(remote_media_preview_stream_target(&resource, Path::new("/cos tam.mp3")).is_none());
+    }
+
+    #[test]
+    fn polish_operation_not_permitted_triggers_sftp_retry() {
+        let error = io::Error::other("chown: operacja nie dozwolona");
+
+        assert!(is_sftp_retry_error(&error));
+    }
 }

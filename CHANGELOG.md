@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+## 0.1.2 - 2026-04-30
+
+### Dodano
+
+- Niewidoczny podgląd multimediów pod `F3`, uruchamiany i zatrzymywany bez otwierania zewnętrznego okna.
+- Dynamiczne ładowanie `bass.dll` i pluginów `bass*.dll` dla podglądu audio z plików lokalnych oraz z zasobów sieciowych.
+- Strumieniowanie podglądu multimediów z zasobów HTTP, HTTPS, FTP, FTPS i WebDAV, gdy zasób nie wymaga hasła.
+- Bezokienny fallback przez `ffplay` lub `mpv` dla plików video, których BASS nie potrafi otworzyć.
+- Zasoby sieciowe HTTP i HTTPS tylko do odczytu z parsowaniem typowych listingów katalogów.
+- Edycję uprawnień SFTP przez `chmod` i `chown`, także rekurencyjnie oraz z ponowieniem przez sudo/root przy odmowie dostępu.
+
+### Zmieniono
+
+- Dialog uprawnień SFTP ma pola wyboru odczyt, zapis i wykonanie dla właściciela, grupy oraz innych.
+- Dialog dodawania i edycji połączenia pokazuje pole klucza SSH tylko dla SFTP.
+- Parser listingów HTTP/HTTPS odczytuje rozmiary także z tabel HTML, w tym wartości z przecinkiem dziesiętnym.
+- Komunikaty błędów HTTP 403 są bardziej jednoznaczne, gdy serwer pokazuje plik w listingu, ale odmawia pobrania.
+
 ## 0.1.1 - 2026-04-24
 
 ### Zmieniono

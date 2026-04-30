@@ -1,6 +1,6 @@
 #define MyAppName "Amiga FM"
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.1.2"
 #endif
 #define MyAppPublisher "TurekCom"
 #define MyAppExeName "amiga_fm.exe"
@@ -29,9 +29,11 @@ Name: "polish"; MessagesFile: "compiler:Languages\Polish.isl"
 [Files]
 Source: "..\target\release\amiga_fm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\nvdaControllerClient.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\bass*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\readme.md"; DestDir: "{app}"; DestName: "README.md"; Flags: ignoreversion
 Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\NOTICE.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD_PARTY_BASS.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\license.txt"; DestDir: "{app}"; DestName: "LICENSE-NVDA-CONTROLLER.txt"; Flags: ignoreversion
 
 [Icons]

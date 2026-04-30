@@ -8,7 +8,9 @@ Amiga FM to lekki, natywny menedżer plików dla Windows napisany w Rust. Interf
 - Dostępność przez natywne kontrolki Win32 i komunikaty NVDA Controller Client.
 - Operacje na plikach: kopiowanie, przenoszenie, usuwanie, zmiana nazwy, tworzenie katalogów.
 - Schowek Windows: `Ctrl+C`, `Ctrl+X`, `Ctrl+V` między Amiga FM i innymi aplikacjami.
-- Zasoby sieciowe: SFTP, SMB, FTP, FTPS, WebDAV i NFS.
+- Zasoby sieciowe: SFTP, SMB, FTP, FTPS, WebDAV, NFS oraz HTTP/HTTPS tylko do odczytu.
+- Niewidoczny podgląd multimediów pod `F3`: audio z plików lokalnych i zdalnych jest odtwarzane bez otwierania osobnego okna.
+- Podgląd multimediów strumieniuje z HTTP/HTTPS, FTP/FTPS i WebDAV, jeśli zasób nie wymaga hasła.
 - Wyszukiwanie lokalne i rekurencyjne z wyrażeniami regularnymi.
 - Ulubione katalogi i pliki.
 - Obsługa archiwów i obrazów przez 7-Zip: otwieranie, wypakowywanie, dodawanie plików, usuwanie z archiwum.
@@ -21,8 +23,16 @@ Amiga FM to lekki, natywny menedżer plików dla Windows napisany w Rust. Interf
 - Windows 10 lub nowszy, 64-bit.
 - NVDA jest opcjonalny, ale program ma dodatkowe komunikaty dla NVDA.
 - Do obsługi archiwów wymagany jest 7-Zip z `7z.exe` w standardowej lokalizacji albo w `PATH`.
+- Do podglądu multimediów dołączone są 64-bitowe biblioteki `bass.dll` i pluginy `bass*.dll` w katalogu `x64`; build kopiuje je obok `amiga_fm.exe`.
+- Jeśli BASS albo pluginy BASS nie obsłużą danego pliku video, program spróbuje bezokiennie użyć `ffplay.exe` albo `mpv.exe` z `PATH`.
 
-Instalator zawiera aplikację i bibliotekę `nvdaControllerClient.dll`. 7-Zip nie jest dołączony do instalatora.
+Instalator zawiera aplikację, `nvdaControllerClient.dll` oraz dostępne biblioteki `bass*.dll`. 7-Zip nie jest dołączony do instalatora.
+
+## HTTP i HTTPS
+
+Zasoby HTTP/HTTPS służą do przeglądania publicznych listingów katalogów, na przykład stron typu `Index of /pliki/` z Apache albo Nginx. Można wchodzić w podkatalogi, otwierać pliki i kopiować je na dysk lokalny albo do innego obsługiwanego zasobu. Protokół HTTP/HTTPS w tej aplikacji jest tylko do odczytu, więc tworzenie katalogów, usuwanie, zmiana nazwy i kopiowanie do takiego zasobu nie są dostępne.
+
+Parser obsługuje klasyczne listingi tekstowe oraz proste tabele HTML z rozmiarem pliku w osobnej kolumnie.
 
 ## Instalacja
 
@@ -37,6 +47,7 @@ Pobierz najnowszy plik `AmigaFM-Setup-*.exe` z sekcji Releases i uruchom instala
 - `Ctrl+A`: zaznacza wszystko.
 - `Ctrl+C`, `Ctrl+X`, `Ctrl+V`: kopiuj, wytnij, wklej.
 - `F2`: zmiana nazwy.
+- `F3`: włącza lub wyłącza niewidoczny podgląd multimediów.
 - `F7`: nowy katalog.
 - `Delete`: usuwanie.
 - `Ctrl+F`: wyszukiwanie.
@@ -52,7 +63,7 @@ Pobierz najnowszy plik `AmigaFM-Setup-*.exe` z sekcji Releases i uruchom instala
 cargo build --release
 ```
 
-Wynik znajduje się w `target\release\amiga_fm.exe`. Skrypt budowania kopiuje `x64\nvdaControllerClient.dll` do katalogu release.
+Wynik znajduje się w `target\release\amiga_fm.exe`. Skrypt budowania kopiuje `x64\nvdaControllerClient.dll` do katalogu release. Jeśli w katalogu `x64` znajdują się pliki `bass*.dll`, zostaną skopiowane do katalogu release i uwzględnione przez instalator.
 
 ## Budowanie instalatora
 
@@ -68,4 +79,8 @@ Instalator zostanie utworzony w `installer\output`.
 
 `nvdaControllerClient.dll` jest dystrybuowany na licencji LGPL 2.1. Pełna treść licencji znajduje się w `license.txt`.
 
+Biblioteki BASS pochodzą z Un4seen Developments. BASS jest darmowy do użytku niekomercyjnego; dystrybucja komercyjna wymaga właściwej licencji BASS. Szczegóły są w `THIRD_PARTY_BASS.md`.
+
 Obsługa archiwów korzysta z zewnętrznego programu 7-Zip zainstalowanego w systemie użytkownika.
+
+Podgląd multimediów korzysta z biblioteki BASS ładowanej dynamicznie w czasie działania programu. Dla formatów video niedostępnych w BASS może zostać użyty zewnętrzny `ffplay` albo `mpv`.
